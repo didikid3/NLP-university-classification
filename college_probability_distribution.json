@@ -1,0 +1,385 @@
+{
+  "total_records": 2630191,
+  "distribution": {
+    "UIUC": {
+      "count": 134533,
+      "probability": 0.05114951727840297
+    },
+    "rutgers": {
+      "count": 110089,
+      "probability": 0.04185589563647659
+    },
+    "ucla": {
+      "count": 105617,
+      "probability": 0.04015563888706181
+    },
+    "berkeley": {
+      "count": 100764,
+      "probability": 0.03831052573748447
+    },
+    "UCSD": {
+      "count": 97533,
+      "probability": 0.037082097840042794
+    },
+    "UCI": {
+      "count": 80677,
+      "probability": 0.03067343778455633
+    },
+    "ucf": {
+      "count": 75433,
+      "probability": 0.028679666229562795
+    },
+    "Purdue": {
+      "count": 71189,
+      "probability": 0.02706609519993035
+    },
+    "UMD": {
+      "count": 70824,
+      "probability": 0.026927322008173552
+    },
+    "Cornell": {
+      "count": 69175,
+      "probability": 0.02630037134185312
+    },
+    "SBU": {
+      "count": 68755,
+      "probability": 0.026140687121201465
+    },
+    "ufl": {
+      "count": 67917,
+      "probability": 0.025822079080948874
+    },
+    "OSU": {
+      "count": 64761,
+      "probability": 0.024622166222909286
+    },
+    "UCDavis": {
+      "count": 60667,
+      "probability": 0.023065625272081
+    },
+    "UCSantaBarbara": {
+      "count": 58170,
+      "probability": 0.02211626456025437
+    },
+    "UCSC": {
+      "count": 55823,
+      "probability": 0.0212239339272319
+    },
+    "aggies": {
+      "count": 53074,
+      "probability": 0.020178762683014276
+    },
+    "NEU": {
+      "count": 47158,
+      "probability": 0.01792949637497809
+    },
+    "gatech": {
+      "count": 46029,
+      "probability": 0.017500249981845423
+    },
+    "uofm": {
+      "count": 44219,
+      "probability": 0.01681208703094186
+    },
+    "BostonU": {
+      "count": 43974,
+      "probability": 0.016718937902228392
+    },
+    "ASU": {
+      "count": 42797,
+      "probability": 0.016271441883878395
+    },
+    "ucr": {
+      "count": 40838,
+      "probability": 0.015526629054696027
+    },
+    "csuf": {
+      "count": 37364,
+      "probability": 0.014205812429591616
+    },
+    "nyu": {
+      "count": 36572,
+      "probability": 0.013904693613505634
+    },
+    "VirginiaTech": {
+      "count": 35924,
+      "probability": 0.013658323673071652
+    },
+    "CSULB": {
+      "count": 34109,
+      "probability": 0.01296825971954128
+    },
+    "USC": {
+      "count": 33210,
+      "probability": 0.012626459447241663
+    },
+    "UWMadison": {
+      "count": 32785,
+      "probability": 0.012464874223963203
+    },
+    "gmu": {
+      "count": 31717,
+      "probability": 0.012058820062877562
+    },
+    "CalPolyPomona": {
+      "count": 30461,
+      "probability": 0.011581288203024039
+    },
+    "msu": {
+      "count": 30147,
+      "probability": 0.011461905238060658
+    },
+    "PennStateUniversity": {
+      "count": 29926,
+      "probability": 0.011377880921955859
+    },
+    "uofmn": {
+      "count": 29835,
+      "probability": 0.011343282674148
+    },
+    "GaState": {
+      "count": 27656,
+      "probability": 0.010514825729386192
+    },
+    "UVA": {
+      "count": 26270,
+      "probability": 0.009987867801235728
+    },
+    "Temple": {
+      "count": 25206,
+      "probability": 0.009583334442251533
+    },
+    "RPI": {
+      "count": 24256,
+      "probability": 0.009222143943158501
+    },
+    "CalPoly": {
+      "count": 24216,
+      "probability": 0.009206935922144057
+    },
+    "fsu": {
+      "count": 23193,
+      "probability": 0.008817990784699666
+    },
+    "SDSU": {
+      "count": 23065,
+      "probability": 0.008769325117453448
+    },
+    "UPenn": {
+      "count": 21415,
+      "probability": 0.008141994250607656
+    },
+    "columbia": {
+      "count": 21063,
+      "probability": 0.008008163665680553
+    },
+    "umass": {
+      "count": 20928,
+      "probability": 0.007956836594756806
+    },
+    "BinghamtonUniversity": {
+      "count": 18787,
+      "probability": 0.007142827269958721
+    },
+    "cuboulder": {
+      "count": 16709,
+      "probability": 0.006352770578258385
+    },
+    "CSUS": {
+      "count": 15989,
+      "probability": 0.006079026199998403
+    },
+    "UNLV": {
+      "count": 14508,
+      "probability": 0.005515949221938635
+    },
+    "NJTech": {
+      "count": 14363,
+      "probability": 0.005460820145761277
+    },
+    "Clemson": {
+      "count": 14042,
+      "probability": 0.0053387757771203685
+    },
+    "stanford": {
+      "count": 13842,
+      "probability": 0.005262735672048152
+    },
+    "Northwestern": {
+      "count": 13583,
+      "probability": 0.00516426373597963
+    },
+    "csun": {
+      "count": 12594,
+      "probability": 0.004788245416397516
+    },
+    "SFSU": {
+      "count": 12594,
+      "probability": 0.004788245416397516
+    },
+    "UTK": {
+      "count": 12390,
+      "probability": 0.004710684509223855
+    },
+    "FIU": {
+      "count": 12306,
+      "probability": 0.004678747665093523
+    },
+    "cmu": {
+      "count": 11794,
+      "probability": 0.004484084996108648
+    },
+    "jhu": {
+      "count": 11664,
+      "probability": 0.004434658927811706
+    },
+    "uchicago": {
+      "count": 11569,
+      "probability": 0.0043985398779024035
+    },
+    "wsu": {
+      "count": 10636,
+      "probability": 0.00404381278774051
+    },
+    "auburn": {
+      "count": 10579,
+      "probability": 0.004022141357794928
+    },
+    "IndianaUniversity": {
+      "count": 10293,
+      "probability": 0.003913404007541658
+    },
+    "washu": {
+      "count": 9444,
+      "probability": 0.0035906137615100957
+    },
+    "LSU": {
+      "count": 9336,
+      "probability": 0.0035495521047710986
+    },
+    "txstate": {
+      "count": 9130,
+      "probability": 0.0034712307965467145
+    },
+    "OregonStateUniv": {
+      "count": 8468,
+      "probability": 0.003219538048757676
+    },
+    "uofu": {
+      "count": 7410,
+      "probability": 0.0028172858929256467
+    },
+    "duke": {
+      "count": 7310,
+      "probability": 0.0027792658403895383
+    },
+    "Emory": {
+      "count": 7192,
+      "probability": 0.00273440217839693
+    },
+    "mit": {
+      "count": 7100,
+      "probability": 0.0026994237300637103
+    },
+    "Vanderbilt": {
+      "count": 7097,
+      "probability": 0.002698283128487627
+    },
+    "WPI": {
+      "count": 7016,
+      "probability": 0.002667486885933379
+    },
+    "byu": {
+      "count": 7004,
+      "probability": 0.002662924479629046
+    },
+    "UofArizona": {
+      "count": 6988,
+      "probability": 0.0026568412712232687
+    },
+    "capstone": {
+      "count": 6855,
+      "probability": 0.0026062746013502443
+    },
+    "Harvard": {
+      "count": 6811,
+      "probability": 0.0025895457782343563
+    },
+    "unr": {
+      "count": 5935,
+      "probability": 0.002256490118018045
+    },
+    "Fordham": {
+      "count": 5309,
+      "probability": 0.0020184845891420052
+    },
+    "williamandmary": {
+      "count": 5264,
+      "probability": 0.0020013755655007566
+    },
+    "baylor": {
+      "count": 5145,
+      "probability": 0.0019561317029827873
+    },
+    "yale": {
+      "count": 5020,
+      "probability": 0.0019086066373126514
+    },
+    "bostoncollege": {
+      "count": 4701,
+      "probability": 0.001787322669722465
+    },
+    "Msstate": {
+      "count": 4598,
+      "probability": 0.0017481620156102732
+    },
+    "Tufts": {
+      "count": 3951,
+      "probability": 0.0015021722757016505
+    },
+    "princeton": {
+      "count": 3946,
+      "probability": 0.0015002712730748451
+    },
+    "UMiami": {
+      "count": 3859,
+      "probability": 0.0014671938273684306
+    },
+    "OKState": {
+      "count": 3851,
+      "probability": 0.001464152223165542
+    },
+    "dartmouth": {
+      "count": 3639,
+      "probability": 0.0013835497117889917
+    },
+    "FAU": {
+      "count": 3570,
+      "probability": 0.0013573158755390768
+    },
+    "riceuniversity": {
+      "count": 3436,
+      "probability": 0.0013063690051406914
+    },
+    "ColoradoSchoolOfMines": {
+      "count": 2836,
+      "probability": 0.0010782486899240397
+    },
+    "UniversityofKansas": {
+      "count": 2809,
+      "probability": 0.0010679832757392903
+    },
+    "Lehigh": {
+      "count": 2589,
+      "probability": 0.0009843391601598514
+    },
+    "CSUC": {
+      "count": 2516,
+      "probability": 0.0009565845218084923
+    },
+    "miamioh": {
+      "count": 2480,
+      "probability": 0.0009428973028954931
+    }
+  }
+}
