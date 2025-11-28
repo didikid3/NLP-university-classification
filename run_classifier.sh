@@ -22,7 +22,7 @@ python train_classifier.py \
   --class-weight balanced \
   --epochs 1 \
   --batch-size 64 \
-  --max-length 128 \
+  --max-length 512 \
   --log-steps 500 \
   --eval-steps 50000 \
   --eval-samples 10000 \
