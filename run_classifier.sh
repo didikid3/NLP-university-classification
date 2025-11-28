@@ -19,8 +19,9 @@ python train_classifier.py \
   --model answerdotai/ModernBERT-base \
   --outdir model_out \
   --wandb-project college-classification \
+  --class-weight balanced \
   --epochs 1 \
-  --batch-size 16 \
+  --batch-size 64 \
   --max-length 128 \
   --log-steps 500 \
   --eval-steps 50000 \

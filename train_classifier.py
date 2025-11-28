@@ -181,12 +181,21 @@ def autocast_context(device, dtype=torch.bfloat16):
 
 
 class BertForCollege(nn.Module):
-    def __init__(self, model_name, num_labels, dropout=0.1):
+    def __init__(self, model_name, num_labels, dropout=0.1, class_weight=None):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
         hidden_size = self.bert.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_size, num_labels)
+        # register class weight as a buffer so it moves with the model device
+        if class_weight is not None:
+            cw = torch.tensor(class_weight, dtype=torch.float)
+            # ensure proper shape
+            if cw.ndim == 0:
+                cw = cw.unsqueeze(0)
+            self.register_buffer('class_weight', cw)
+        else:
+            self.register_buffer('class_weight', None)
 
     def forward(self, input_ids=None, attention_mask=None, token_type_ids=None, labels=None):
         # Some models (e.g. ModernBERT) do not accept `token_type_ids` as a kwarg.
@@ -203,7 +212,12 @@ class BertForCollege(nn.Module):
         logits = self.classifier(pooled)
         loss = None
         if labels is not None:
-            loss_fct = nn.CrossEntropyLoss()
+            # use class weights if provided
+            cw = self.class_weight if isinstance(getattr(self, 'class_weight', None), torch.Tensor) else None
+            if cw is not None:
+                loss_fct = nn.CrossEntropyLoss(weight=cw)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits, labels)
         return loss, logits
 
@@ -284,7 +298,12 @@ def evaluate(model, dataloader, device, max_samples=None):
             # compute summed loss for the (possibly sliced) batch so we can
             # report an average loss over all evaluated samples
             try:
-                loss_fct = nn.CrossEntropyLoss(reduction='sum')
+                cw = getattr(model, 'class_weight', None)
+                cw = cw if isinstance(cw, torch.Tensor) else None
+                if cw is not None:
+                    loss_fct = nn.CrossEntropyLoss(reduction='sum', weight=cw)
+                else:
+                    loss_fct = nn.CrossEntropyLoss(reduction='sum')
                 batch_loss_sum = loss_fct(logits, labels).item()
             except Exception:
                 batch_loss_sum = 0.0
@@ -430,6 +449,62 @@ def reservoir_sample(path, mapping, sample_size, text_key_priority=('title', 'se
     return reservoir
 
 
+def compute_label_counts(path, mapping, num_labels, max_limit=None):
+    """Count label occurrences in a newline-JSON (.zst) file.
+
+    Returns a list of length `num_labels` with integer counts for each label id.
+    """
+    p = Path(path)
+    counts = [0] * int(num_labels)
+    if not p.exists():
+        return counts
+    dctx = zstd.ZstdDecompressor()
+    seen = 0
+    try:
+        with open(p, 'rb') as fh:
+            with dctx.stream_reader(fh) as reader:
+                it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
+                for raw_line in it:
+                    try:
+                        obj = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sub = obj.get('subreddit') or obj.get('subreddit_name')
+                    if sub is None:
+                        continue
+                    label = mapping.get(sub)
+                    if label is None:
+                        continue
+                    if 0 <= int(label) < num_labels:
+                        counts[int(label)] += 1
+                    seen += 1
+                    if max_limit is not None and seen >= max_limit:
+                        break
+    except zstd.ZstdError:
+        with open(p, 'r', encoding='utf-8', errors='replace') as fh_text:
+            for raw_line in fh_text:
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                sub = obj.get('subreddit') or obj.get('subreddit_name')
+                if sub is None:
+                    continue
+                label = mapping.get(sub)
+                if label is None:
+                    continue
+                if 0 <= int(label) < num_labels:
+                    counts[int(label)] += 1
+                seen += 1
+                if max_limit is not None and seen >= max_limit:
+                    break
+    return counts
+
+
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
@@ -469,6 +544,54 @@ def train(args):
     num_labels = len(mapping)
     print(f'Number of labels: {num_labels}')
 
+    # handle class weight specification (None / 'balanced' / JSON path / CSV)
+    class_weight_tensor = None
+    if getattr(args, 'class_weight', None):
+        cw_arg = args.class_weight
+        # balanced: compute inverse-frequency weights from training data
+        if cw_arg == 'balanced':
+            print('Computing balanced class weights from training data (this may scan the train file)')
+            counts = compute_label_counts(args.train, mapping, num_labels, max_limit=(args.max_train if args.max_train else None))
+            total = float(sum(counts)) if sum(counts) > 0 else 0.0
+            if total > 0:
+                weights = [ (total / (num_labels * c)) if c > 0 else 0.0 for c in counts ]
+            else:
+                weights = [1.0] * num_labels
+            class_weight_tensor = torch.tensor(weights, dtype=torch.float)
+        else:
+            # cw_arg might be a path to a JSON file, or comma-separated list of floats
+            p = Path(cw_arg)
+            if p.exists():
+                try:
+                    with open(p, 'r', encoding='utf-8') as f:
+                        obj = json.load(f)
+                    if isinstance(obj, list) and len(obj) == num_labels:
+                        weights = [float(x) for x in obj]
+                    elif isinstance(obj, dict):
+                        # mapping from label-name or id to weight
+                        weights = [0.0] * num_labels
+                        for k, v in obj.items():
+                            try:
+                                idx = int(k)
+                            except Exception:
+                                idx = mapping.get(k)
+                            if idx is not None and 0 <= int(idx) < num_labels:
+                                weights[int(idx)] = float(v)
+                    else:
+                        raise ValueError('Unexpected JSON format for class weights')
+                    class_weight_tensor = torch.tensor(weights, dtype=torch.float)
+                except Exception as e:
+                    raise SystemExit(f'Unable to read class-weight JSON from {p}: {e}')
+            else:
+                # try parse comma-separated floats
+                try:
+                    parts = [float(x) for x in cw_arg.split(',')]
+                    if len(parts) != num_labels:
+                        raise ValueError('Number of class-weight values does not match number of labels')
+                    class_weight_tensor = torch.tensor(parts, dtype=torch.float)
+                except Exception as e:
+                    raise SystemExit(f'Unable to parse --class-weight argument: {e}')
+
     # initialize wandb if requested and available
     use_wandb = (args.wandb_project is not None) and (wandb is not None) and (not args.no_wandb)
     if use_wandb:
@@ -477,7 +600,7 @@ def train(args):
         wandb.config.update({k: v for k, v in vars(args).items() if not k.startswith('_')})
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = BertForCollege(args.model, num_labels)
+    model = BertForCollege(args.model, num_labels, class_weight=(class_weight_tensor.tolist() if class_weight_tensor is not None else None))
     model.to(device)
 
     # validation dataset (no skipping needed)
@@ -725,7 +848,7 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=1)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--max-length', type=int, default=256)
-    p.add_argument('--lr', type=float, default=2e-5)
+    p.add_argument('--lr', type=float, default=1e-4)
     p.add_argument('--max-train', type=int, default=None, help='Limit number of train samples for quick runs')
     p.add_argument('--max-val', type=int, default=None, help='Limit number of val samples')
     p.add_argument('--log-steps', type=int, default=100)
@@ -740,6 +863,7 @@ def parse_args():
     p.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team/user)')
     p.add_argument('--wandb-run', type=str, default=None, help='W&B run name (optional)')
     p.add_argument('--no-wandb', action='store_true', help='Disable wandb even if installed')
+    p.add_argument('--class-weight', type=str, default=None, help="Specify class weights: 'balanced' to compute inverse-frequency, path to JSON (list or dict), or comma-separated floats")
     return p.parse_args()
 
 
