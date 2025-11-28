@@ -19,11 +19,12 @@ python train_classifier.py \
   --model answerdotai/ModernBERT-base \
   --outdir model_out \
   --wandb-project college-classification \
-  --epochs 2 \
-  --batch-size 8 \
+  --epochs 1 \
+  --batch-size 16 \
   --max-length 128 \
   --log-steps 500 \
   --eval-steps 5000 \
+  --eval-samples 1000 \
   --save-steps 7500 \
   --enable-tf32 \
   --use-bf16

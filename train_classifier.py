@@ -233,12 +233,19 @@ def load_mapping(mapping_path=None, dist_path=None, out_json=None):
     raise FileNotFoundError('No mapping or distribution file found')
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, max_samples=None):
+    """Evaluate `model` on `dataloader`.
+
+    If `max_samples` is provided and > 0, evaluation will stop after approximately
+    `max_samples` examples (the final batch will be sliced to exactly reach the
+    requested count).
+    """
     model.eval()
     total = 0
     correct = 0
     preds = []
     trues = []
+    max_samples = None if (max_samples is None or max_samples <= 0) else int(max_samples)
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='eval'):
             input_ids = batch['input_ids'].to(device)
@@ -247,10 +254,23 @@ def evaluate(model, dataloader, device):
             # evaluation forward; if caller wants bf16 autocast they will wrap around evaluate
             _, logits = model(input_ids=input_ids, attention_mask=attention_mask)
             pred = torch.argmax(logits, dim=-1)
+
+            # If we have a max_samples limit, possibly slice the final batch so we
+            # return metrics computed on exactly that many samples.
+            if max_samples is not None:
+                remaining = max_samples - total
+                if remaining <= 0:
+                    break
+                if labels.size(0) > remaining:
+                    pred = pred[:remaining]
+                    labels = labels[:remaining]
+
             preds.extend(pred.cpu().tolist())
             trues.extend(labels.cpu().tolist())
             total += labels.size(0)
             correct += (pred == labels).sum().item()
+            if max_samples is not None and total >= max_samples:
+                break
     acc = correct / total if total else 0.0
     try:
         from sklearn.metrics import f1_score
@@ -466,10 +486,10 @@ def train(args):
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
                 if use_bf16 and device.type == 'cuda':
-                    with autocast_context(device, dtype=torch.bfloat16):
-                        mid_metrics = evaluate(model, val_loader, device)
+                            with autocast_context(device, dtype=torch.bfloat16):
+                                mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
                 else:
-                    mid_metrics = evaluate(model, val_loader, device)
+                            mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
                 print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                 if use_wandb:
                     wandb.log({f'val/{k}': v for k, v in mid_metrics.items() if v is not None})
@@ -581,6 +601,7 @@ def parse_args():
     p.add_argument('--save-steps', type=int, default=1000, help='Save a periodic checkpoint every N samples processed')
     p.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     p.add_argument('--eval-steps', type=int, default=0, help='Run evaluation every N samples processed (0 to disable)')
+    p.add_argument('--eval-samples', type=int, default=0, help='If >0, evaluate only this many validation samples (speeds up mid/epoch eval)')
     p.add_argument('--enable-tf32', action='store_true', help='Enable TF32 / float32 matmul precision for faster training on Ampere+ GPUs')
     p.add_argument('--use-bf16', action='store_true', help='Use bfloat16 autocast for training/eval when supported by device')
     p.add_argument('--wandb-project', type=str, default=None, help='W&B project name to log to')
