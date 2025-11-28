@@ -62,6 +62,56 @@ class ZstdJsonDataset(IterableDataset):
     def __iter__(self):
         dctx = zstd.ZstdDecompressor()
         with open(self.path, 'rb') as fh:
+            # Try to open as a Zstd stream; if that fails (unknown frame descriptor,
+            # truncated file, or file is plain-text), fall back to reading as plain
+            # text so the error is clearer and processing can continue where possible.
+            try:
+                with dctx.stream_reader(fh) as reader:
+                    it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
+                    matched = 0
+                    for raw_line in it:
+                        # normal zstd-stream reading loop
+                        pass
+            except zstd.ZstdError as e:
+                # fallback: try reading the file as plain text (maybe it was not
+                # actually compressed or contains a bad frame). Seek to start.
+                print(f'Warning: zstd decompression failed for {self.path}: {e}; attempting plain-text fallback')
+                fh.seek(0)
+                it = io.TextIOWrapper(fh, encoding='utf-8', errors='replace')
+                matched = 0
+                for raw_line in it:
+                    # plain-text reading loop
+                    try:
+                        obj = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sub = obj.get('subreddit') or obj.get('subreddit_name')
+                    if sub is None:
+                        continue
+                    label = self.mapping.get(sub)
+                    if label is None:
+                        continue
+                    parts = []
+                    for k in self.text_key_priority:
+                        v = obj.get(k)
+                        if v:
+                            parts.append(v)
+                    text = '\n'.join(parts).strip()
+                    if not text:
+                        continue
+                    matched += 1
+                    if self.max_samples is not None and matched > self.max_samples:
+                        break
+                    if matched <= self.skip:
+                        continue
+                    yield {'text': text, 'label': label}
+                return
+            # if we reached here, we used the zstd branch; now resume the proper loop
+            # Re-open the zstd stream reader and iterate normally to yield items.
+            # (We avoid duplicating the JSON parsing logic by rewinding and re-entering the stream)
+            fh.seek(0)
             with dctx.stream_reader(fh) as reader:
                 it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
                 matched = 0
