@@ -17,4 +17,4 @@ python eval_model.py \
     --mapping college_to_id.py \
     --model answerdotai/ModernBERT-base \
     --checkpoint model_out/pytorch_model_epoch1.pt \
-    --max-val 100
+    # --max-val 100
