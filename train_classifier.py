@@ -252,11 +252,14 @@ def evaluate(model, dataloader, device, max_samples=None):
     `max_samples` examples (the final batch will be sliced to exactly reach the
     requested count).
     """
+    # preserve current training/eval mode so we can restore it after evaluation
+    was_training = model.training
     model.eval()
     total = 0
     correct = 0
     preds = []
     trues = []
+    total_loss_sum = 0.0
     max_samples = None if (max_samples is None or max_samples <= 0) else int(max_samples)
     with torch.no_grad():
         for batch in tqdm(dataloader, desc='eval'):
@@ -274,12 +277,23 @@ def evaluate(model, dataloader, device, max_samples=None):
                 if remaining <= 0:
                     break
                 if labels.size(0) > remaining:
+                    logits = logits[:remaining]
                     pred = pred[:remaining]
                     labels = labels[:remaining]
 
+            # compute summed loss for the (possibly sliced) batch so we can
+            # report an average loss over all evaluated samples
+            try:
+                loss_fct = nn.CrossEntropyLoss(reduction='sum')
+                batch_loss_sum = loss_fct(logits, labels).item()
+            except Exception:
+                batch_loss_sum = 0.0
+
+            total_loss_sum += float(batch_loss_sum)
             preds.extend(pred.cpu().tolist())
             trues.extend(labels.cpu().tolist())
-            total += labels.size(0)
+            batch_n = labels.size(0)
+            total += batch_n
             correct += (pred == labels).sum().item()
             if max_samples is not None and total >= max_samples:
                 break
@@ -290,7 +304,16 @@ def evaluate(model, dataloader, device, max_samples=None):
         macro = f1_score(trues, preds, average='macro')
     except Exception:
         micro = macro = None
-    return {'accuracy': acc, 'micro_f1': micro, 'macro_f1': macro}
+    avg_loss = (total_loss_sum / total) if total else 0.0
+    # restore previous mode
+    try:
+        if was_training:
+            model.train()
+        else:
+            model.eval()
+    except Exception:
+        pass
+    return {'loss': avg_loss, 'accuracy': acc, 'micro_f1': micro, 'macro_f1': macro}
 
 
 def count_records(path, mapping=None, max_limit=None):
@@ -482,9 +505,12 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     # rough total steps for scheduler (used if scheduler state not loaded)
     total_steps = args.epochs * (args.max_train // args.batch_size if args.max_train else 1000)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=max(1, total_steps))
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=max(1, total_steps))
 
     best_val = -1.0
+
+    # global step counter used for WandB logging (monotonic across epochs)
+    global_step = 0
 
     # compute effective number of train samples per epoch (if available)
     effective = None
@@ -557,6 +583,8 @@ def train(args):
             optimizer.step()
             scheduler.step()
             optimizer.zero_grad()
+            # increment global_step once per optimization step/batch
+            global_step += 1
             running_loss += loss.item()
             # update samples processed (actual number in this batch)
             batch_count = labels.size(0)
@@ -606,14 +634,20 @@ def train(args):
                     print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                     if use_wandb:
                         log_dict = {f'val/{k}': v for k, v in mid_metrics.items() if v is not None}
-                        wandb.log(log_dict)
+                        try:
+                            wandb.log(log_dict, step=global_step)
+                        except Exception:
+                            wandb.log(log_dict)
 
             if step and step % args.log_steps == 0:
                 avg_loss = running_loss / args.log_steps
                 print(f'Epoch {epoch} step {step} loss {avg_loss:.4f}')
-                # wandb log train loss
+                # wandb log train loss (use global_step for a consistent x-axis)
                 if use_wandb:
-                    wandb.log({'train/loss': avg_loss, 'train/epoch': epoch, 'train/step': step})
+                    try:
+                        wandb.log({'train/loss': avg_loss}, step=global_step)
+                    except Exception:
+                        wandb.log({'train/loss': avg_loss})
                 running_loss = 0.0
 
         # evaluate at epoch end (if validation set provided)
@@ -632,7 +666,10 @@ def train(args):
             print(f'Validation metrics after epoch {epoch}:', metrics)
             if use_wandb:
                 log_dict = {f'val/{k}': v for k, v in metrics.items() if v is not None}
-                wandb.log(log_dict)
+                try:
+                    wandb.log(log_dict, step=global_step)
+                except Exception:
+                    wandb.log(log_dict)
 
         # always save an epoch checkpoint (and also save best when improved)
         out_dir = Path(args.outdir)
