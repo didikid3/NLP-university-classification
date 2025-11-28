@@ -25,6 +25,7 @@ import math
 import os
 import random
 from pathlib import Path
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -507,6 +508,39 @@ def compute_label_counts(path, mapping, num_labels, max_limit=None):
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # reproducibility: seed various RNGs if requested
+    if getattr(args, 'seed', None) is not None:
+        seed = int(args.seed)
+        # Python random
+        random.seed(seed)
+        # numpy
+        try:
+            np.random.seed(seed)
+        except Exception:
+            pass
+        # torch
+        try:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+        except Exception:
+            pass
+        # set deterministic algorithms where possible
+        try:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+        except Exception:
+            pass
+        try:
+            # PyTorch 1.8+ has this API
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+        # set PYTHONHASHSEED for best-effort reproducibility (must be set before process start to be fully effective)
+        try:
+            os.environ['PYTHONHASHSEED'] = str(seed)
+        except Exception:
+            pass
     # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
     if getattr(args, 'enable_tf32', False) and torch.cuda.is_available():
         try:
@@ -864,6 +898,7 @@ def parse_args():
     p.add_argument('--wandb-run', type=str, default=None, help='W&B run name (optional)')
     p.add_argument('--no-wandb', action='store_true', help='Disable wandb even if installed')
     p.add_argument('--class-weight', type=str, default=None, help="Specify class weights: 'balanced' to compute inverse-frequency, path to JSON (list or dict), or comma-separated floats")
+    p.add_argument('--seed', type=int, default=None, help='Optional random seed for reproducibility (sets python/numpy/torch seeds)')
     return p.parse_args()
 
 

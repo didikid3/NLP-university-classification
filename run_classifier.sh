@@ -21,13 +21,14 @@ python train_classifier.py \
   --wandb-project college-classification \
   --class-weight balanced \
   --epochs 1 \
-  --batch-size 64 \
-  --max-length 512 \
+  --batch-size 16 \
+  --max-length 256 \
   --log-steps 500 \
   --eval-steps 50000 \
   --eval-samples 10000 \
   --eval-random \
   --save-steps 200000 \
+  --seed 1234 \
   --enable-tf32 \
   --use-bf16
 # python train_classifier.py \
