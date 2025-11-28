@@ -146,6 +146,18 @@ def collate_batch(batch, tokenizer, max_length=256):
     return enc
 
 
+class ListDataset(torch.utils.data.Dataset):
+    """Wrap a list of examples (dicts) so it can be used with DataLoader."""
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        return self.items[idx]
+
+
 def autocast_context(device, dtype=torch.bfloat16):
     """Return an autocast context manager compatible with the installed PyTorch.
 
@@ -310,6 +322,89 @@ def count_records(path, mapping=None, max_limit=None):
                 if max_limit is not None and c >= max_limit:
                     break
     return c
+
+
+def reservoir_sample(path, mapping, sample_size, text_key_priority=('title', 'selftext')):
+    """Return a random sample (list of dicts) of up to `sample_size` matching records
+    from a newline-JSON (possibly .zst) file using reservoir sampling. This is a
+    single-pass, memory-efficient sampler suitable for large files.
+    """
+    p = Path(path)
+    if not p.exists() or sample_size <= 0:
+        return []
+    sample_size = int(sample_size)
+    dctx = zstd.ZstdDecompressor()
+    reservoir = []
+    seen = 0
+    try:
+        with open(p, 'rb') as fh:
+            with dctx.stream_reader(fh) as reader:
+                it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
+                for raw_line in it:
+                    try:
+                        obj = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sub = obj.get('subreddit') or obj.get('subreddit_name')
+                    if sub is None:
+                        continue
+                    label = mapping.get(sub)
+                    if label is None:
+                        continue
+                    parts = []
+                    for k in text_key_priority:
+                        v = obj.get(k)
+                        if v:
+                            parts.append(v)
+                    text = '\n'.join(parts).strip()
+                    if not text:
+                        continue
+                    seen += 1
+                    entry = {'text': text, 'label': label}
+                    if len(reservoir) < sample_size:
+                        reservoir.append(entry)
+                    else:
+                        # replace with decreasing probability
+                        import random as _rnd
+                        j = _rnd.randrange(seen)
+                        if j < sample_size:
+                            reservoir[j] = entry
+    except zstd.ZstdError:
+        # fallback to plain text
+        with open(p, 'r', encoding='utf-8', errors='replace') as fh_text:
+            for raw_line in fh_text:
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                sub = obj.get('subreddit') or obj.get('subreddit_name')
+                if sub is None:
+                    continue
+                label = mapping.get(sub)
+                if label is None:
+                    continue
+                parts = []
+                for k in text_key_priority:
+                    v = obj.get(k)
+                    if v:
+                        parts.append(v)
+                text = '\n'.join(parts).strip()
+                if not text:
+                    continue
+                seen += 1
+                entry = {'text': text, 'label': label}
+                if len(reservoir) < sample_size:
+                    reservoir.append(entry)
+                else:
+                    import random as _rnd
+                    j = _rnd.randrange(seen)
+                    if j < sample_size:
+                        reservoir[j] = entry
+    return reservoir
 
 
 def train(args):
@@ -485,42 +580,40 @@ def train(args):
 
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
-                if use_bf16 and device.type == 'cuda':
+                # For mid-epoch eval we may want to use a random subset to avoid
+                # repeatedly evaluating the same head-of-file examples (which can
+                # bias metrics). If `--eval-random` is set and `--eval-samples` > 0,
+                # draw a reservoir sample and evaluate on that.
+                mid_metrics = None
+                if getattr(args, 'eval_random', False) and args.eval_samples and args.eval_samples > 0:
+                    sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+                    if len(sampled) == 0:
+                        print('Warning: eval_random requested but no validation samples found; skipping mid-epoch eval')
+                    else:
+                        tmp_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
+                        if use_bf16 and device.type == 'cuda':
                             with autocast_context(device, dtype=torch.bfloat16):
-                                mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                                mid_metrics = evaluate(model, tmp_loader, device)
+                        else:
+                            mid_metrics = evaluate(model, tmp_loader, device)
                 else:
+                    if use_bf16 and device.type == 'cuda':
+                        with autocast_context(device, dtype=torch.bfloat16):
                             mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
-                print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
-                if use_wandb:
-                    wandb.log({f'val/{k}': v for k, v in mid_metrics.items() if v is not None})
-                    wandb.log({'val/samples_processed': samples_processed})
-                # update best checkpoint if improved
-                try:
-                    score = mid_metrics['micro_f1'] if mid_metrics.get('micro_f1') is not None else mid_metrics.get('accuracy')
-                except Exception:
-                    score = None
-                if score is not None and score > best_val:
-                    best_val = score
-                    best_save_path = Path(args.outdir) / 'pytorch_model.pt'
-                    torch.save({
-                        'model_state_dict': model.state_dict(),
-                        'optimizer_state_dict': optimizer.state_dict(),
-                        'scheduler_state_dict': scheduler.state_dict(),
-                        'mapping': mapping,
-                        'epoch': epoch,
-                        'samples_processed': samples_processed,
-                        'metrics': mid_metrics
-                    }, best_save_path)
-                    print(f'Saved best model (mid-epoch) to {best_save_path} at samples {samples_processed}')
+                    else:
+                        mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                if mid_metrics is not None:
+                    print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                     if use_wandb:
-                        wandb.save(str(best_save_path))
+                        log_dict = {f'val/{k}': v for k, v in mid_metrics.items() if v is not None}
+                        wandb.log(log_dict)
 
             if step and step % args.log_steps == 0:
                 avg_loss = running_loss / args.log_steps
                 print(f'Epoch {epoch} step {step} loss {avg_loss:.4f}')
                 # wandb log train loss
                 if use_wandb:
-                    wandb.log({'train/loss': avg_loss, 'train/epoch': epoch, 'train/step': step, 'train/samples_processed': samples_processed})
+                    wandb.log({'train/loss': avg_loss, 'train/epoch': epoch, 'train/step': step})
                 running_loss = 0.0
 
         # evaluate at epoch end (if validation set provided)
@@ -538,7 +631,8 @@ def train(args):
                 metrics = evaluate(model, val_loader, device)
             print(f'Validation metrics after epoch {epoch}:', metrics)
             if use_wandb:
-                wandb.log({f'val/{k}': v for k, v in metrics.items() if v is not None})
+                log_dict = {f'val/{k}': v for k, v in metrics.items() if v is not None}
+                wandb.log(log_dict)
 
         # always save an epoch checkpoint (and also save best when improved)
         out_dir = Path(args.outdir)
@@ -602,6 +696,7 @@ def parse_args():
     p.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     p.add_argument('--eval-steps', type=int, default=0, help='Run evaluation every N samples processed (0 to disable)')
     p.add_argument('--eval-samples', type=int, default=0, help='If >0, evaluate only this many validation samples (speeds up mid/epoch eval)')
+    p.add_argument('--eval-random', action='store_true', help='Use random reservoir-sampled validation subset for mid-epoch evaluation')
     p.add_argument('--enable-tf32', action='store_true', help='Enable TF32 / float32 matmul precision for faster training on Ampere+ GPUs')
     p.add_argument('--use-bf16', action='store_true', help='Use bfloat16 autocast for training/eval when supported by device')
     p.add_argument('--wandb-project', type=str, default=None, help='W&B project name to log to')

@@ -23,9 +23,10 @@ python train_classifier.py \
   --batch-size 16 \
   --max-length 128 \
   --log-steps 500 \
-  --eval-steps 5000 \
-  --eval-samples 1000 \
-  --save-steps 7500 \
+  --eval-steps 50000 \
+  --eval-samples 10000 \
+  --eval-random \
+  --save-steps 200000 \
   --enable-tf32 \
   --use-bf16
 # python train_classifier.py \
