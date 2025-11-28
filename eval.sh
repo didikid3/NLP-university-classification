@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=Project-train
+#SBATCH --job-name=Project-eval
 #SBATCH --account=eecs595f25_class
 #SBATCH --partition=spgpu
 #SBATCH --gpus=1
@@ -10,7 +10,7 @@
 #SBATCH --mem-per-cpu=40g
 #SBATCH --mail-user=bchao@umich.edu
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --output=logs/train_BERT.out
+#SBATCH --output=logs/eval_BERT.out
 
 python eval_model.py \
     --val splits/test.zst \
