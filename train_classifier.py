@@ -544,11 +544,6 @@ def train(args):
     # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
     if getattr(args, 'enable_tf32', False) and torch.cuda.is_available():
         try:
-            # Preferred new API (PyTorch 2.x+)
-            torch.set_float32_matmul_precision('high')
-            print('Enabled float32 matmul precision: high')
-        except Exception:
-            # Fallbacks for older PyTorch versions
             try:
                 torch.backends.cuda.matmul.allow_tf32 = True
             except Exception:
@@ -557,10 +552,8 @@ def train(args):
                 torch.backends.cudnn.allow_tf32 = True
             except Exception:
                 pass
-            # newer PyTorch may expose additional conv fp32 precision settings;
-            # we intentionally skip touching those here and rely on set_float32_matmul_precision
-            # or the allow_tf32 fallbacks above.
-            print('Enabled TF32 (fallback APIs)')
+        except Exception:
+            print("Some issue setting up TF 32")
     # bfloat16 usage: check if requested and supported
     use_bf16 = False
     if getattr(args, 'use_bf16', False) and torch.cuda.is_available():
