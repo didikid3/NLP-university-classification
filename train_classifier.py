@@ -35,31 +35,39 @@ import zstandard as zstd
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 
 try:
-    from tqdm.auto import tqdm
+    from tqdm.auto import tqdm  # type: ignore
 except Exception:
-    def tqdm(it, **kwargs):
+    from typing import Any
+    def tqdm(it: Any, **kwargs: Any) -> Any:
         return it
 
 
-class ZstdJsonDataset(IterableDataset):
-    """Streams newline JSON objects from a .zst file and yields dicts."""
+import wandb
 
-    def __init__(self, path, mapping, max_samples=None, text_key_priority=('title','selftext')):
+
+class ZstdJsonDataset(IterableDataset):
+    """Streams newline JSON objects from a .zst file and yields dicts.
+
+    Supports skipping a number of matching records (useful for resuming mid-epoch).
+    """
+
+    def __init__(self, path, mapping, max_samples=None, text_key_priority=('title','selftext'), skip: int = 0):
         self.path = Path(path)
         self.mapping = mapping
         self.max_samples = max_samples
         self.text_key_priority = text_key_priority
+        # number of matching records to skip (only counts records that would be yielded)
+        self.skip = int(skip or 0)
 
     def __iter__(self):
         dctx = zstd.ZstdDecompressor()
         with open(self.path, 'rb') as fh:
             with dctx.stream_reader(fh) as reader:
                 it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
-                for i, line in enumerate(it, start=1):
-                    if self.max_samples is not None and i > self.max_samples:
-                        break
+                matched = 0
+                for raw_line in it:
                     try:
-                        obj = json.loads(line)
+                        obj = json.loads(raw_line)
                     except Exception:
                         continue
                     if not isinstance(obj, dict):
@@ -69,7 +77,6 @@ class ZstdJsonDataset(IterableDataset):
                         continue
                     label = self.mapping.get(sub)
                     if label is None:
-                        # skip unknown labels
                         continue
                     # build text: prefer title + separator + selftext
                     parts = []
@@ -79,6 +86,13 @@ class ZstdJsonDataset(IterableDataset):
                             parts.append(v)
                     text = '\n'.join(parts).strip()
                     if not text:
+                        continue
+                    # this is a matching record we would yield
+                    matched += 1
+                    if self.max_samples is not None and matched > self.max_samples:
+                        break
+                    # skip initial matching records when resuming
+                    if matched <= self.skip:
                         continue
                     yield {'text': text, 'label': label}
 
@@ -220,17 +234,22 @@ def train(args):
     num_labels = len(mapping)
     print(f'Number of labels: {num_labels}')
 
+    # initialize wandb if requested and available
+    use_wandb = (args.wandb_project is not None) and (wandb is not None) and (not args.no_wandb)
+    if use_wandb:
+        wandb.init(project=args.wandb_project, entity=args.wandb_entity, name=args.wandb_run)
+        # log config
+        wandb.config.update({k: v for k, v in vars(args).items() if not k.startswith('_')})
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = BertForCollege(args.model, num_labels)
     model.to(device)
 
-    train_ds = ZstdJsonDataset(args.train, mapping, max_samples=args.max_train)
+    # validation dataset (no skipping needed)
     val_ds = ZstdJsonDataset(args.val, mapping, max_samples=args.max_val) if args.val else None
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=lambda b: collate_batch(b, tokenizer, max_length=args.max_length)) if val_ds else None
 
     collate = lambda batch: collate_batch(batch, tokenizer, max_length=args.max_length)
-
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collate)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=collate) if val_ds else None
     # Count available records (respecting mapping) to provide tqdm totals/ETAs.
     # This performs a quick pass over the compressed file(s); it's fast relative
     # to a full training run and gives accurate step counts for progress bars.
@@ -249,18 +268,70 @@ def train(args):
         print(f'Available val records (matching mapping):   {available_val:,}')
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # rough total steps for scheduler (used if scheduler state not loaded)
     total_steps = args.epochs * (args.max_train // args.batch_size if args.max_train else 1000)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=max(1, total_steps))
 
     best_val = -1.0
-    for epoch in range(1, args.epochs + 1):
+
+    # compute effective number of train samples per epoch (if available)
+    effective = None
+    if available_train is not None:
+        effective = available_train if args.max_train is None else min(available_train, args.max_train)
+
+    # Resume support: load checkpoint if provided
+    start_epoch = 1
+    samples_processed = 0
+    if args.resume:
+        ckpt_path = Path(args.resume)
+        if ckpt_path.exists():
+            print(f'Loading checkpoint {ckpt_path} to resume')
+            ckpt = torch.load(str(ckpt_path), map_location=device)
+            if 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            if 'optimizer_state_dict' in ckpt and ckpt['optimizer_state_dict'] is not None:
+                try:
+                    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                except Exception:
+                    print('Warning: failed to fully load optimizer state; continuing with fresh optimizer')
+            if 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
+                try:
+                    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+                except Exception:
+                    print('Warning: failed to fully load scheduler state')
+            start_epoch = int(ckpt.get('epoch', 1))
+            samples_processed = int(ckpt.get('samples_processed', 0))
+            # compute skip inside epoch (number of matching records already consumed in this epoch)
+            skip_in_epoch = 0
+            if effective is not None and effective > 0:
+                skip_in_epoch = samples_processed % effective
+                # if the checkpoint was exactly at epoch boundary, start next epoch
+                if skip_in_epoch == 0 and samples_processed > 0:
+                    start_epoch = start_epoch + 1
+            else:
+                skip_in_epoch = 0
+            print(f'Resuming from epoch {start_epoch} with {samples_processed} samples processed (skip_in_epoch={skip_in_epoch})')
+        else:
+            print(f'Warning: resume checkpoint {args.resume} not found; starting fresh')
+            skip_in_epoch = 0
+    else:
+        skip_in_epoch = 0
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         running_loss = 0.0
-        # compute total steps for tqdm if we could count available records
+
+        # prepare train dataset for this epoch; on the first resumed epoch we may skip some records
+        this_epoch_skip = skip_in_epoch if epoch == start_epoch else 0
+        train_ds = ZstdJsonDataset(args.train, mapping, max_samples=args.max_train, skip=this_epoch_skip)
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, collate_fn=collate)
+
+        # compute total steps for tqdm for this epoch if we could count available records
         train_total_steps = None
-        if available_train is not None:
-            effective = available_train if args.max_train is None else min(available_train, args.max_train)
-            train_total_steps = math.ceil(effective / args.batch_size) if effective is not None else None
+        if effective is not None:
+            effective_for_epoch = effective - (this_epoch_skip if epoch == start_epoch else 0)
+            train_total_steps = math.ceil(effective_for_epoch / args.batch_size) if effective_for_epoch is not None else None
+
         for step, batch in enumerate(tqdm(train_loader, desc=f'train epoch {epoch}', total=train_total_steps)):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
@@ -271,27 +342,116 @@ def train(args):
             scheduler.step()
             optimizer.zero_grad()
             running_loss += loss.item()
+            # update samples processed (actual number in this batch)
+            batch_count = labels.size(0)
+            samples_processed += int(batch_count)
+            # periodic save
+            if args.save_steps and samples_processed and samples_processed % args.save_steps == 0:
+                out_dir = Path(args.outdir)
+                out_dir.mkdir(parents=True, exist_ok=True)
+                ckpt_path = out_dir / f'checkpoint_samples_{samples_processed}.pt'
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'mapping': mapping,
+                    'epoch': epoch,
+                    'samples_processed': samples_processed
+                }, ckpt_path)
+                print(f'Saved periodic checkpoint to {ckpt_path} (samples_processed={samples_processed})')
+                if use_wandb:
+                    wandb.save(str(ckpt_path))
+
+            # periodic evaluation (mid-epoch)
+            if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
+                mid_metrics = evaluate(model, val_loader, device)
+                print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
+                if use_wandb:
+                    wandb.log({f'val/{k}': v for k, v in mid_metrics.items() if v is not None})
+                    wandb.log({'val/samples_processed': samples_processed})
+                # update best checkpoint if improved
+                try:
+                    score = mid_metrics['micro_f1'] if mid_metrics.get('micro_f1') is not None else mid_metrics.get('accuracy')
+                except Exception:
+                    score = None
+                if score is not None and score > best_val:
+                    best_val = score
+                    best_save_path = Path(args.outdir) / 'pytorch_model.pt'
+                    torch.save({
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scheduler_state_dict': scheduler.state_dict(),
+                        'mapping': mapping,
+                        'epoch': epoch,
+                        'samples_processed': samples_processed,
+                        'metrics': mid_metrics
+                    }, best_save_path)
+                    print(f'Saved best model (mid-epoch) to {best_save_path} at samples {samples_processed}')
+                    if use_wandb:
+                        wandb.save(str(best_save_path))
+
             if step and step % args.log_steps == 0:
-                print(f'Epoch {epoch} step {step} loss {running_loss / args.log_steps:.4f}')
+                avg_loss = running_loss / args.log_steps
+                print(f'Epoch {epoch} step {step} loss {avg_loss:.4f}')
+                # wandb log train loss
+                if use_wandb:
+                    wandb.log({'train/loss': avg_loss, 'train/epoch': epoch, 'train/step': step, 'train/samples_processed': samples_processed})
                 running_loss = 0.0
 
+        # evaluate at epoch end (if validation set provided)
+        metrics = None
         if val_loader is not None:
             # provide tqdm total for evaluation as well
             val_total_steps = None
             if available_val is not None:
                 effective_val = available_val if args.max_val is None else min(available_val, args.max_val)
                 val_total_steps = math.ceil(effective_val / args.batch_size) if effective_val is not None else None
-            # build an iterator that passes total into tqdm inside evaluate()
             metrics = evaluate(model, val_loader, device)
             print(f'Validation metrics after epoch {epoch}:', metrics)
+            if use_wandb:
+                wandb.log({f'val/{k}': v for k, v in metrics.items() if v is not None})
+
+        # always save an epoch checkpoint (and also save best when improved)
+        out_dir = Path(args.outdir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        epoch_save_path = out_dir / f'pytorch_model_epoch{epoch}.pt'
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'mapping': mapping,
+            'epoch': epoch,
+            'samples_processed': samples_processed,
+            'metrics': metrics
+        }, epoch_save_path)
+        print(f'Saved epoch checkpoint to {epoch_save_path}')
+        if use_wandb:
+            wandb.save(str(epoch_save_path))
+
+        # save best checkpoint based on validation score (if available)
+        if metrics is not None:
             score = metrics['micro_f1'] if metrics['micro_f1'] is not None else metrics['accuracy']
             if score is not None and score > best_val:
                 best_val = score
-                out_dir = Path(args.outdir)
-                out_dir.mkdir(parents=True, exist_ok=True)
-                print(f'Saving model to {out_dir}')
-                # save state dict only
-                torch.save({'model_state_dict': model.state_dict(), 'mapping': mapping}, out_dir / 'pytorch_model.pt')
+                best_save_path = out_dir / 'pytorch_model.pt'
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'mapping': mapping,
+                    'epoch': epoch,
+                    'samples_processed': samples_processed,
+                    'metrics': metrics
+                }, best_save_path)
+                print(f'Saved best model to {best_save_path}')
+                if use_wandb:
+                    wandb.save(str(best_save_path))
+        else:
+            # no validation metrics available; optionally update best by other heuristics
+            pass
+
+    if use_wandb:
+        wandb.finish()
 
 
 def parse_args():
@@ -309,6 +469,13 @@ def parse_args():
     p.add_argument('--max-train', type=int, default=None, help='Limit number of train samples for quick runs')
     p.add_argument('--max-val', type=int, default=None, help='Limit number of val samples')
     p.add_argument('--log-steps', type=int, default=100)
+    p.add_argument('--save-steps', type=int, default=1000, help='Save a periodic checkpoint every N samples processed')
+    p.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
+    p.add_argument('--eval-steps', type=int, default=0, help='Run evaluation every N samples processed (0 to disable)')
+    p.add_argument('--wandb-project', type=str, default=None, help='W&B project name to log to')
+    p.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team/user)')
+    p.add_argument('--wandb-run', type=str, default=None, help='W&B run name (optional)')
+    p.add_argument('--no-wandb', action='store_true', help='Disable wandb even if installed')
     return p.parse_args()
 
 
