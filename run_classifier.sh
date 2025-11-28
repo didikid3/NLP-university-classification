@@ -25,7 +25,8 @@ python train_classifier.py \
   --log-steps 500 \
   --eval-steps 5000 \
   --save-steps 7500 \
-
+  --enable-tf32 \
+  --use-bf16
 # python train_classifier.py \
 #   --train splits/train.zst \
 #   --val splits/val.zst \

@@ -28,11 +28,13 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+from torch.amp import autocast
 from torch.utils.data import DataLoader, IterableDataset
 
 import zstandard as zstd
 
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from contextlib import nullcontext
 
 try:
     from tqdm.auto import tqdm  # type: ignore
@@ -144,6 +146,28 @@ def collate_batch(batch, tokenizer, max_length=256):
     return enc
 
 
+def autocast_context(device, dtype=torch.bfloat16):
+    """Return an autocast context manager compatible with the installed PyTorch.
+
+    Prefers the unified `torch.autocast` API when available (newer PyTorch),
+    otherwise falls back to `torch.cuda.amp.autocast` for CUDA devices. If
+    autocast isn't available or the device isn't CUDA, returns a no-op context.
+    """
+    if device is None or device.type != 'cuda':
+        return nullcontext()
+    # try unified API first
+    try:
+        autocast_fn = getattr(torch, 'autocast')
+        return autocast_fn(device_type='cuda', dtype=dtype)
+    except Exception:
+        pass
+    # fallback to cuda amp autocast
+    try:
+        return torch.cuda.amp.autocast(dtype=dtype)
+    except Exception:
+        return nullcontext()
+
+
 class BertForCollege(nn.Module):
     def __init__(self, model_name, num_labels, dropout=0.1):
         super().__init__()
@@ -220,6 +244,7 @@ def evaluate(model, dataloader, device):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
+            # evaluation forward; if caller wants bf16 autocast they will wrap around evaluate
             _, logits = model(input_ids=input_ids, attention_mask=attention_mask)
             pred = torch.argmax(logits, dim=-1)
             preds.extend(pred.cpu().tolist())
@@ -269,6 +294,39 @@ def count_records(path, mapping=None, max_limit=None):
 
 def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
+    if getattr(args, 'enable_tf32', False) and torch.cuda.is_available():
+        try:
+            # Preferred new API (PyTorch 2.x+)
+            torch.set_float32_matmul_precision('high')
+            print('Enabled float32 matmul precision: high')
+        except Exception:
+            # Fallbacks for older PyTorch versions
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True
+            except Exception:
+                pass
+            # newer PyTorch may expose additional conv fp32 precision settings;
+            # we intentionally skip touching those here and rely on set_float32_matmul_precision
+            # or the allow_tf32 fallbacks above.
+            print('Enabled TF32 (fallback APIs)')
+    # bfloat16 usage: check if requested and supported
+    use_bf16 = False
+    if getattr(args, 'use_bf16', False) and torch.cuda.is_available():
+        is_bf16_supported = getattr(torch.cuda, 'is_bf16_supported', None)
+        try:
+            supported = is_bf16_supported() if callable(is_bf16_supported) else False
+        except Exception:
+            supported = False
+        if supported:
+            use_bf16 = True
+            print('bfloat16 autocast enabled for training/eval')
+        else:
+            print('Warning: --use-bf16 requested but device/PyTorch does not report bf16 support; continuing without bf16')
     mapping = load_mapping(args.mapping, args.dist, out_json=args.mapping if args.mapping and not Path(args.mapping).exists() else None)
     num_labels = len(mapping)
     print(f'Number of labels: {num_labels}')
@@ -375,7 +433,11 @@ def train(args):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
-            loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            if use_bf16 and device.type == 'cuda':
+                with autocast_context(device, dtype=torch.bfloat16):
+                    loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+            else:
+                loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             loss.backward()
             optimizer.step()
             scheduler.step()
@@ -403,7 +465,11 @@ def train(args):
 
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
-                mid_metrics = evaluate(model, val_loader, device)
+                if use_bf16 and device.type == 'cuda':
+                    with autocast_context(device, dtype=torch.bfloat16):
+                        mid_metrics = evaluate(model, val_loader, device)
+                else:
+                    mid_metrics = evaluate(model, val_loader, device)
                 print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                 if use_wandb:
                     wandb.log({f'val/{k}': v for k, v in mid_metrics.items() if v is not None})
@@ -445,7 +511,11 @@ def train(args):
             if available_val is not None:
                 effective_val = available_val if args.max_val is None else min(available_val, args.max_val)
                 val_total_steps = math.ceil(effective_val / args.batch_size) if effective_val is not None else None
-            metrics = evaluate(model, val_loader, device)
+            if use_bf16 and device.type == 'cuda':
+                with autocast_context(device, dtype=torch.bfloat16):
+                    metrics = evaluate(model, val_loader, device)
+            else:
+                metrics = evaluate(model, val_loader, device)
             print(f'Validation metrics after epoch {epoch}:', metrics)
             if use_wandb:
                 wandb.log({f'val/{k}': v for k, v in metrics.items() if v is not None})
@@ -511,6 +581,8 @@ def parse_args():
     p.add_argument('--save-steps', type=int, default=1000, help='Save a periodic checkpoint every N samples processed')
     p.add_argument('--resume', type=str, default=None, help='Path to checkpoint to resume from')
     p.add_argument('--eval-steps', type=int, default=0, help='Run evaluation every N samples processed (0 to disable)')
+    p.add_argument('--enable-tf32', action='store_true', help='Enable TF32 / float32 matmul precision for faster training on Ampere+ GPUs')
+    p.add_argument('--use-bf16', action='store_true', help='Use bfloat16 autocast for training/eval when supported by device')
     p.add_argument('--wandb-project', type=str, default=None, help='W&B project name to log to')
     p.add_argument('--wandb-entity', type=str, default=None, help='W&B entity (team/user)')
     p.add_argument('--wandb-run', type=str, default=None, help='W&B run name (optional)')
