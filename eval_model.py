@@ -59,20 +59,42 @@ def load_checkpoint_into_model(model, ckpt_path, device):
     # support both full state dicts and wrapped dicts used by train
     if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
         state = ckpt['model_state_dict']
-    elif isinstance(ckpt, dict) and all(k.startswith('bert') or k in model.state_dict() for k in ckpt.keys()):
-        # heuristically accept this as a raw state_dict
-        state = ckpt
+    elif isinstance(ckpt, dict) and 'state_dict' in ckpt:
+        state = ckpt['state_dict']
     else:
-        # last resort: try to pull 'state_dict' or use as-is
-        state = ckpt.get('state_dict', None) if isinstance(ckpt, dict) else None
-        if state is None:
-            # try loading whole object into model (may error)
-            try:
-                model.load_state_dict(ckpt)
-                return model
-            except Exception as e:
-                raise RuntimeError(f'Unable to interpret checkpoint format: {e}')
-    model.load_state_dict(state)
+        state = ckpt if isinstance(ckpt, dict) else None
+
+    # If state is not a dict, try loading it directly
+    if not isinstance(state, dict):
+        try:
+            model.load_state_dict(state)
+            return model
+        except Exception as e:
+            raise RuntimeError(f'Unable to interpret checkpoint format: {e}')
+
+    # Normalize keys: handle DataParallel prefixes ('module.') by stripping
+    model_keys = set(model.state_dict().keys())
+    filtered = {}
+    for k, v in state.items():
+        if k in model_keys:
+            filtered[k] = v
+        else:
+            # try stripping common prefixes
+            if k.startswith('module.') and k[len('module.'): ] in model_keys:
+                filtered[k[len('module.'):]] = v
+
+    # Load filtered state dict with strict=False so unexpected/mismatched
+    # keys (e.g. legacy 'class_weight') are ignored rather than raising.
+    load_result = model.load_state_dict(filtered, strict=False)
+    # load_state_dict returns a namedtuple with missing/unexpected keys in newer PyTorch
+    try:
+        missing = load_result.missing_keys
+        unexpected = load_result.unexpected_keys
+        if missing or unexpected:
+            print(f'Checkpoint load: missing keys={missing}, unexpected keys={unexpected}')
+    except Exception:
+        # older PyTorch versions may not return the same structure; ignore
+        pass
     return model
 
 

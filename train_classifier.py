@@ -532,8 +532,34 @@ def train(args):
         except Exception:
             pass
         try:
-            # PyTorch 1.8+ has this API
-            torch.use_deterministic_algorithms(True)
+            # PyTorch 1.8+ has this API. Enabling strict deterministic algorithms
+            # can require setting CUBLAS_WORKSPACE_CONFIG before the process
+            # starts when CUDA/cuBLAS is in use. If that env var is not present
+            # we avoid enabling strict mode to prevent runtime failures and
+            # instead enable a warn-only mode where supported.
+            if torch.cuda.is_available() and 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
+                print("Warning: deterministic algorithms requested but CUDA/cuBLAS requires setting\n"
+                      "the environment variable CUBLAS_WORKSPACE_CONFIG before starting Python.\n"
+                      "To enable strict determinism, set e.g. `export CUBLAS_WORKSPACE_CONFIG=:4096:8`\n"
+                      "and re-run the script. Falling back to best-effort deterministic mode (no crash).")
+                # Some PyTorch versions accept warn_only flag; try that first
+                try:
+                    torch.use_deterministic_algorithms(True, warn_only=True)
+                except TypeError:
+                    try:
+                        # older/newer PyTorch may not accept warn_only; try plain call
+                        torch.use_deterministic_algorithms(True)
+                    except Exception:
+                        # give up silently to avoid crashing user runs
+                        pass
+            else:
+                try:
+                    torch.use_deterministic_algorithms(True)
+                except TypeError:
+                    try:
+                        torch.use_deterministic_algorithms(True, warn_only=True)
+                    except Exception:
+                        pass
         except Exception:
             pass
         # set PYTHONHASHSEED for best-effort reproducibility (must be set before process start to be fully effective)
@@ -689,6 +715,11 @@ def train(args):
                     print('Warning: failed to fully load scheduler state')
             start_epoch = int(ckpt.get('epoch', 1))
             samples_processed = int(ckpt.get('samples_processed', 0))
+            # restore global_step if saved in checkpoint, otherwise approximate
+            try:
+                global_step = int(ckpt.get('global_step', samples_processed // (args.batch_size if args.batch_size else 1)))
+            except Exception:
+                global_step = 0
             # compute skip inside epoch (number of matching records already consumed in this epoch)
             skip_in_epoch = 0
             if effective is not None and effective > 0:
@@ -750,7 +781,8 @@ def train(args):
                     'scheduler_state_dict': scheduler.state_dict(),
                     'mapping': mapping,
                     'epoch': epoch,
-                    'samples_processed': samples_processed
+                    'samples_processed': samples_processed,
+                    'global_step': global_step
                 }, ckpt_path)
                 print(f'Saved periodic checkpoint to {ckpt_path} (samples_processed={samples_processed})')
                 if use_wandb:
@@ -832,7 +864,8 @@ def train(args):
             'mapping': mapping,
             'epoch': epoch,
             'samples_processed': samples_processed,
-            'metrics': metrics
+            'metrics': metrics,
+            'global_step': global_step
         }, epoch_save_path)
         print(f'Saved epoch checkpoint to {epoch_save_path}')
         if use_wandb:
@@ -851,7 +884,8 @@ def train(args):
                     'mapping': mapping,
                     'epoch': epoch,
                     'samples_processed': samples_processed,
-                    'metrics': metrics
+                    'metrics': metrics,
+                    'global_step': global_step
                 }, best_save_path)
                 print(f'Saved best model to {best_save_path}')
                 if use_wandb:
