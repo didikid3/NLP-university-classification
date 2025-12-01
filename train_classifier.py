@@ -525,43 +525,6 @@ def train(args):
                 torch.cuda.manual_seed_all(seed)
         except Exception:
             pass
-        # set deterministic algorithms where possible
-        try:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        except Exception:
-            pass
-        try:
-            # PyTorch 1.8+ has this API. Enabling strict deterministic algorithms
-            # can require setting CUBLAS_WORKSPACE_CONFIG before the process
-            # starts when CUDA/cuBLAS is in use. If that env var is not present
-            # we avoid enabling strict mode to prevent runtime failures and
-            # instead enable a warn-only mode where supported.
-            if torch.cuda.is_available() and 'CUBLAS_WORKSPACE_CONFIG' not in os.environ:
-                print("Warning: deterministic algorithms requested but CUDA/cuBLAS requires setting\n"
-                      "the environment variable CUBLAS_WORKSPACE_CONFIG before starting Python.\n"
-                      "To enable strict determinism, set e.g. `export CUBLAS_WORKSPACE_CONFIG=:4096:8`\n"
-                      "and re-run the script. Falling back to best-effort deterministic mode (no crash).")
-                # Some PyTorch versions accept warn_only flag; try that first
-                try:
-                    torch.use_deterministic_algorithms(True, warn_only=True)
-                except TypeError:
-                    try:
-                        # older/newer PyTorch may not accept warn_only; try plain call
-                        torch.use_deterministic_algorithms(True)
-                    except Exception:
-                        # give up silently to avoid crashing user runs
-                        pass
-            else:
-                try:
-                    torch.use_deterministic_algorithms(True)
-                except TypeError:
-                    try:
-                        torch.use_deterministic_algorithms(True, warn_only=True)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         # set PYTHONHASHSEED for best-effort reproducibility (must be set before process start to be fully effective)
         try:
             os.environ['PYTHONHASHSEED'] = str(seed)
@@ -678,9 +641,14 @@ def train(args):
     if available_val is not None:
         print(f'Available val records (matching mapping):   {available_val:,}')
 
+    # compute effective number of train samples per epoch (if available)
+    effective = None
+    if available_train is not None:
+        effective = available_train if args.max_train is None else min(available_train, args.max_train)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     # rough total steps for scheduler (used if scheduler state not loaded)
-    total_steps = args.epochs * (args.max_train // args.batch_size if args.max_train else 1000)
+    total_steps = args.epochs * (effective // args.batch_size if effective else 1000)
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=max(1, total_steps))
 
     best_val = -1.0
@@ -688,10 +656,7 @@ def train(args):
     # global step counter used for WandB logging (monotonic across epochs)
     global_step = 0
 
-    # compute effective number of train samples per epoch (if available)
-    effective = None
-    if available_train is not None:
-        effective = available_train if args.max_train is None else min(available_train, args.max_train)
+    
 
     # Resume support: load checkpoint if provided
     start_epoch = 1
@@ -876,7 +841,7 @@ def train(args):
             score = metrics['micro_f1'] if metrics['micro_f1'] is not None else metrics['accuracy']
             if score is not None and score > best_val:
                 best_val = score
-                best_save_path = out_dir / 'pytorch_model.pt'
+                best_save_path = out_dir / 'pytorch_model.pt' 
                 torch.save({
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
