@@ -624,6 +624,18 @@ def train(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=lambda b: collate_batch(b, tokenizer, max_length=args.max_length)) if val_ds else None
 
     collate = lambda batch: collate_batch(batch, tokenizer, max_length=args.max_length)
+    # If the user requests a fixed evaluation subset via --eval-samples, build
+    # that subset once at startup and reuse it for mid-epoch and epoch-end
+    # evaluation. This avoids repeatedly scanning the full validation file and
+    # ensures the same examples are evaluated each time.
+    fixed_eval_loader = None
+    if getattr(args, 'eval_samples', 0) and args.eval_samples > 0 and args.val:
+        print(f'Preparing fixed evaluation subset of {args.eval_samples} samples from {args.val}')
+        sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+        if len(sampled) == 0:
+            print('Warning: requested eval_samples but no validation samples found; falling back to full validation loader')
+        else:
+            fixed_eval_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
     # Count available records (respecting mapping) to provide tqdm totals/ETAs.
     # This performs a quick pass over the compressed file(s); it's fast relative
     # to a full training run and gives accurate step counts for progress bars.
@@ -755,28 +767,38 @@ def train(args):
 
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
-                # For mid-epoch eval we may want to use a random subset to avoid
-                # repeatedly evaluating the same head-of-file examples (which can
-                # bias metrics). If `--eval-random` is set and `--eval-samples` > 0,
-                # draw a reservoir sample and evaluate on that.
+                # Mid-epoch evaluation. Prefer using the precomputed fixed eval
+                # subset (if created above when --eval-samples was set). If no
+                # fixed subset exists, fall back to either a per-call random
+                # reservoir sample (when --eval-random) or the validation loader
+                # (optionally limited by --eval-samples via evaluate's max_samples).
                 mid_metrics = None
-                if getattr(args, 'eval_random', False) and args.eval_samples and args.eval_samples > 0:
-                    sampled = reservoir_sample(args.val, mapping, args.eval_samples)
-                    if len(sampled) == 0:
-                        print('Warning: eval_random requested but no validation samples found; skipping mid-epoch eval')
-                    else:
-                        tmp_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
-                        if use_bf16 and device.type == 'cuda':
-                            with autocast_context(device, dtype=torch.bfloat16):
-                                mid_metrics = evaluate(model, tmp_loader, device)
-                        else:
-                            mid_metrics = evaluate(model, tmp_loader, device)
-                else:
+                # Use fixed subset if available
+                if fixed_eval_loader is not None:
+                    tmp_loader = fixed_eval_loader
                     if use_bf16 and device.type == 'cuda':
                         with autocast_context(device, dtype=torch.bfloat16):
-                            mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                            mid_metrics = evaluate(model, tmp_loader, device)
                     else:
-                        mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                        mid_metrics = evaluate(model, tmp_loader, device)
+                else:
+                    if getattr(args, 'eval_random', False) and args.eval_samples and args.eval_samples > 0:
+                        sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+                        if len(sampled) == 0:
+                            print('Warning: eval_random requested but no validation samples found; skipping mid-epoch eval')
+                        else:
+                            tmp_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
+                            if use_bf16 and device.type == 'cuda':
+                                with autocast_context(device, dtype=torch.bfloat16):
+                                    mid_metrics = evaluate(model, tmp_loader, device)
+                            else:
+                                mid_metrics = evaluate(model, tmp_loader, device)
+                    else:
+                        if use_bf16 and device.type == 'cuda':
+                            with autocast_context(device, dtype=torch.bfloat16):
+                                mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                        else:
+                            mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
                 if mid_metrics is not None:
                     print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                     if use_wandb:
@@ -805,11 +827,14 @@ def train(args):
             if available_val is not None:
                 effective_val = available_val if args.max_val is None else min(available_val, args.max_val)
                 val_total_steps = math.ceil(effective_val / args.batch_size) if effective_val is not None else None
+            # Use the fixed eval subset if available, otherwise evaluate on the
+            # full validation loader (optionally limited by --max-val / --eval-samples).
+            eval_target_loader = fixed_eval_loader if fixed_eval_loader is not None else val_loader
             if use_bf16 and device.type == 'cuda':
                 with autocast_context(device, dtype=torch.bfloat16):
-                    metrics = evaluate(model, val_loader, device)
+                    metrics = evaluate(model, eval_target_loader, device, max_samples=(args.eval_samples if fixed_eval_loader is None and args.eval_samples and args.eval_samples > 0 else None))
             else:
-                metrics = evaluate(model, val_loader, device)
+                metrics = evaluate(model, eval_target_loader, device, max_samples=(args.eval_samples if fixed_eval_loader is None and args.eval_samples and args.eval_samples > 0 else None))
             print(f'Validation metrics after epoch {epoch}:', metrics)
             if use_wandb:
                 log_dict = {f'val/{k}': v for k, v in metrics.items() if v is not None}
@@ -874,7 +899,7 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=1)
     p.add_argument('--batch-size', type=int, default=8)
     p.add_argument('--max-length', type=int, default=256)
-    p.add_argument('--lr', type=float, default=1e-4)
+    p.add_argument('--lr', type=float, default=2e-5)
     p.add_argument('--max-train', type=int, default=None, help='Limit number of train samples for quick runs')
     p.add_argument('--max-val', type=int, default=None, help='Limit number of val samples')
     p.add_argument('--log-steps', type=int, default=100)
