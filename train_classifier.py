@@ -185,6 +185,7 @@ class BertForCollege(nn.Module):
     def __init__(self, model_name, num_labels, dropout=0.1, class_weight=None):
         super().__init__()
         self.bert = AutoModel.from_pretrained(model_name)
+        self.bert.requires_grad_(True)
         hidden_size = self.bert.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.classifier = nn.Linear(hidden_size, num_labels)
@@ -206,9 +207,10 @@ class BertForCollege(nn.Module):
             bert_kwargs['token_type_ids'] = token_type_ids
         out = self.bert(**bert_kwargs)
         # use pooled output if available, otherwise take CLS token
-        pooled = getattr(out, 'pooler_output', None)
-        if pooled is None:
-            pooled = out.last_hidden_state[:, 0]
+        last_hidden = out.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).expand(last_hidden.size()).float()
+        pooled = (last_hidden * mask).sum(1) / mask.sum(1)
+
         pooled = self.dropout(pooled)
         logits = self.classifier(pooled)
         loss = None

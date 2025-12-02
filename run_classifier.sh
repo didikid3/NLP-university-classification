@@ -22,7 +22,7 @@ python train_classifier.py \
   --epochs 1 \
   --batch-size 16 \
   --max-length 256 \
-  --log-steps 500 \
+  --log-steps 1000 \
   --eval-steps 50000 \
   --eval-samples 10000 \
   --eval-random \
