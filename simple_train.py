@@ -20,6 +20,7 @@ from transformers import (
 from tqdm.auto import tqdm
 import wandb
 
+torch.set_float32_matmul_precision('high')
 
 def load_mapping_py(path):
     spec = importlib.util.spec_from_file_location("college_mapping", path)
@@ -440,6 +441,11 @@ def train(args):
             # ---------------------
             # Mixed precision forward
             # ---------------------
+            # Prevent CUDAGraphs tensor overwrite under torch.compile by marking step boundaries
+            try:
+                torch.compiler.cudagraph_mark_step_begin()
+            except Exception:
+                pass
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(use_bf16 or use_amp)):
                 outputs = model(**batch)
                 # scale loss for gradient accumulation to keep overall effective LR
