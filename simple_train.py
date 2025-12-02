@@ -343,17 +343,6 @@ def train(args):
     # -------------------------------
     # Optimizer + Scheduler (create AFTER model is finalized)
     # -------------------------------
-    # Compile the model to optimize training performance (PyTorch 2.x)
-    # Do this AFTER loading/reshaping weights and enabling checkpointing,
-    # but BEFORE creating the optimizer so parameter references align.
-    try:
-        # Help type checkers: compiled returns a callable module; cast to nn.Module
-        from typing import cast
-        model = cast(nn.Module, torch.compile(model, mode="reduce-overhead", dynamic=False))
-        print("torch.compile ENABLED (mode=reduce-overhead)")
-    except Exception as e:
-        print(f"Warning: torch.compile failed or unavailable: {e}. Proceeding without compilation.")
-
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Determine effective train sample count. Prefer explicit --max-train.
@@ -441,11 +430,6 @@ def train(args):
             # ---------------------
             # Mixed precision forward
             # ---------------------
-            # Prevent CUDAGraphs tensor overwrite under torch.compile by marking step boundaries
-            try:
-                torch.compiler.cudagraph_mark_step_begin()
-            except Exception:
-                pass
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(use_bf16 or use_amp)):
                 outputs = model(**batch)
                 # scale loss for gradient accumulation to keep overall effective LR
