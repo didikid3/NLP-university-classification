@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #SBATCH --job-name=Project-train
-#SBATCH --account=cse585f25_class
+#SBATCH --account=eecs595f25_class
 #SBATCH --partition=spgpu
 #SBATCH --gpus=1
 #SBATCH --time=04:00:00
