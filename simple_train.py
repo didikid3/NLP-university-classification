@@ -165,6 +165,35 @@ def count_matching_samples(zst_path, mapping, max_samples=None):
 
 
 # ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def _compute_f1_from_confmat(confmat):
+    """Compute macro and weighted F1 from a confusion matrix.
+
+    confmat: Tensor [num_labels, num_labels], rows=true labels, cols=predicted
+    Returns (macro_f1, weighted_f1)
+    """
+    confmat = confmat.to(torch.float32)
+    tp = torch.diag(confmat)
+    support = confmat.sum(dim=1)  # true counts per class
+    pred_pos = confmat.sum(dim=0)  # predicted counts per class
+    fp = pred_pos - tp
+    fn = support - tp
+
+    eps = 1e-12
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1_per_class = 2 * precision * recall / (precision + recall + eps)
+
+    # macro over classes with support > 0
+    mask = support > 0
+    macro_f1 = (f1_per_class[mask].mean().item() if mask.any() else 0.0)
+    weighted_f1 = ((f1_per_class * support).sum() / (support.sum() + eps)).item()
+    return macro_f1, weighted_f1
+
+
+# ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
@@ -182,7 +211,7 @@ def train(args):
     print(f"Using bf16: {use_bf16}")
     print(f"Using FP16 AMP: {use_amp}")
 
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device='cuda', enabled=use_amp)
     autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
 
     # -------------------------------
@@ -224,6 +253,7 @@ def train(args):
     # Resume support: training state
     # -------------------------------
     start_epoch = 1
+    # global_step counts optimizer updates (not individual batches)
     global_step = 0
     samples_processed = 0
     resume_skip = 0
@@ -312,6 +342,17 @@ def train(args):
     # -------------------------------
     # Optimizer + Scheduler (create AFTER model is finalized)
     # -------------------------------
+    # Compile the model to optimize training performance (PyTorch 2.x)
+    # Do this AFTER loading/reshaping weights and enabling checkpointing,
+    # but BEFORE creating the optimizer so parameter references align.
+    try:
+        # Help type checkers: compiled returns a callable module; cast to nn.Module
+        from typing import cast
+        model = cast(nn.Module, torch.compile(model, mode="reduce-overhead", dynamic=False))
+        print("torch.compile ENABLED (mode=reduce-overhead)")
+    except Exception as e:
+        print(f"Warning: torch.compile failed or unavailable: {e}. Proceeding without compilation.")
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     # Determine effective train sample count. Prefer explicit --max-train.
@@ -393,34 +434,42 @@ def train(args):
             iterator = tqdm(train_loader, desc=f"Epoch {epoch}")
 
         for step, batch in enumerate(iterator):
-            global_step += 1
             batch = {k: v.to(device) for k, v in batch.items()}
+            grad_accum = max(1, int(getattr(args, 'grad_accum_steps', 1)))
 
             # ---------------------
             # Mixed precision forward
             # ---------------------
             with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=(use_bf16 or use_amp)):
                 outputs = model(**batch)
-                loss = outputs.loss
+                # scale loss for gradient accumulation to keep overall effective LR
+                loss = outputs.loss / grad_accum
 
             # ---------------------
             # Backward
             # ---------------------
             if use_amp:
                 scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
+                # step optimizer only every grad_accum steps
+                if (step + 1) % grad_accum == 0:
+                    scaler.unscale_(optimizer)
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
             else:
                 loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
+                if (step + 1) % grad_accum == 0:
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    scheduler.step()
+                    global_step += 1
 
-            optimizer.zero_grad()
-            scheduler.step()
-
-            running_loss += loss.item()
+            # accumulate unscaled loss for reporting (multiply back by grad_accum)
+            running_loss += (loss.item() * grad_accum)
             samples_processed += batch["labels"].size(0) if "labels" in batch else args.batch_size
 
             # ---------------------
@@ -472,6 +521,8 @@ def train(args):
                     m_correct = 0
                     m_total = 0
                     m_loss = 0.0
+                    # Build confusion matrix for F1
+                    m_confmat = torch.zeros((num_labels, num_labels), dtype=torch.long)
 
                     with torch.no_grad():
                         for batch in mid_eval_loader:
@@ -489,15 +540,25 @@ def train(args):
                             m_correct += (preds == batch["labels"]).sum().item()
                             m_total += batch["labels"].size(0)
 
+                            # update confusion matrix
+                            y = batch["labels"].detach().to("cpu")
+                            p = preds.detach().to("cpu")
+                            idx = y * num_labels + p
+                            bins = torch.bincount(idx, minlength=num_labels * num_labels)
+                            m_confmat += bins.view(num_labels, num_labels)
+
                     m_avg_loss = m_loss / m_total if m_total else 0.0
                     m_acc = m_correct / m_total if m_total else 0.0
+                    m_f1_macro, m_f1_weighted = _compute_f1_from_confmat(m_confmat)
 
-                    print(f"[Mid-Epoch Eval] step={global_step} | acc={m_acc:.4f} | loss={m_avg_loss:.4f}")
+                    print(f"[Mid-Epoch Eval] step={global_step} | acc={m_acc:.4f} | loss={m_avg_loss:.4f} | f1_macro={m_f1_macro:.4f} | f1_weighted={m_f1_weighted:.4f}")
 
                     if args.wandb:
                         wandb.log({
                             "val_acc": m_acc,
-                            "val_loss": m_avg_loss
+                            "val_loss": m_avg_loss,
+                            "val_f1_macro": m_f1_macro,
+                            "val_f1_weighted": m_f1_weighted
                         }, step=global_step)
 
                     model.train()
@@ -510,6 +571,8 @@ def train(args):
             correct = 0
             total = 0
             val_loss = 0.0
+            # Confusion matrix for F1
+            confmat = torch.zeros((num_labels, num_labels), dtype=torch.long)
 
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc=f"Validation"):
@@ -525,12 +588,25 @@ def train(args):
                     correct += (preds == batch["labels"]).sum().item()
                     total += batch["labels"].size(0)
 
+                    # update confusion matrix
+                    y = batch["labels"].detach().to("cpu")
+                    p = preds.detach().to("cpu")
+                    idx = y * num_labels + p
+                    bins = torch.bincount(idx, minlength=num_labels * num_labels)
+                    confmat += bins.view(num_labels, num_labels)
+
             avg_val_loss = val_loss / total if total else 0.0
             acc = correct / total if total else 0.0
-            print(f"Validation accuracy: {acc:.4f} | loss={avg_val_loss:.4f}")
+            f1_macro, f1_weighted = _compute_f1_from_confmat(confmat)
+            print(f"Validation accuracy: {acc:.4f} | loss={avg_val_loss:.4f} | f1_macro={f1_macro:.4f} | f1_weighted={f1_weighted:.4f}")
 
             if args.wandb:
-                wandb.log({"val_acc": acc, "val_loss": avg_val_loss}, step=global_step)
+                wandb.log({
+                    "val_acc": acc,
+                    "val_loss": avg_val_loss,
+                    "val_f1_macro": f1_macro,
+                    "val_f1_weighted": f1_weighted
+                }, step=global_step)
 
         # -------------------------------------------------------------------
         # Save end-of-epoch checkpoint
@@ -582,6 +658,8 @@ def parse_args():
 
     p.add_argument("--max-train", type=int, default=None)
     p.add_argument("--max-val", type=int, default=None)
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Number of gradient accumulation steps before optimizer update")
 
     p.add_argument("--log-steps", type=int, default=1000)
     p.add_argument("--save-steps", type=int, default=200000,

@@ -42,13 +42,14 @@ SAVE_STEPS=200000
 MAX_CHECKPOINTS=5
 
 # mid-epoch evaluation (small subset)
-MID_EVAL_STEPS=50000         # run mini-eval every N training steps (0 = disabled)
+MID_EVAL_STEPS=10000         # run mini-eval every N training steps (0 = disabled)
 MID_EVAL_BATCHES=100        # number of validation batches to evaluate during mid-epoch eval
 
 # training hyperparams
 EPOCHS=1
 BATCH_SIZE=16
-MAX_LENGTH=256
+GRADIENT_ACCUMULATION=4      # set >1 to simulate larger batch size
+MAX_LENGTH=128
 LR=2e-5
 MAX_TRAIN=""                 # set to a number to limit train samples (or leave empty)
 MAX_VAL=""                   # same for val
@@ -80,6 +81,7 @@ $PYTHON simple_train.py \
   --lr $LR \
   $( [ -n "$MAX_TRAIN" ] && echo "--max-train $MAX_TRAIN" || true ) \
   $( [ -n "$MAX_VAL" ] && echo "--max-val $MAX_VAL" || true ) \
+  --grad-accum-steps $GRADIENT_ACCUMULATION \
   --log-steps $LOG_STEPS \
   --save-steps $SAVE_STEPS \
   --max-checkpoints $MAX_CHECKPOINTS \
