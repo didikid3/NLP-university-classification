@@ -571,6 +571,7 @@ def train(args):
             total = float(sum(counts)) if sum(counts) > 0 else 0.0
             if total > 0:
                 weights = [ (total / (num_labels * c)) if c > 0 else 0.0 for c in counts ]
+                weights = [min(5, w) for w in weights]  # cap max weight to avoid extreme values
             else:
                 weights = [1.0] * num_labels
             class_weight_tensor = torch.tensor(weights, dtype=torch.float)
@@ -635,7 +636,11 @@ def train(args):
         if len(sampled) == 0:
             print('Warning: requested eval_samples but no validation samples found; falling back to full validation loader')
         else:
-            fixed_eval_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
+            fixed_eval_loader = DataLoader(
+                ListDataset(sampled),
+                batch_size=args.batch_size,
+                collate_fn=collate
+            )
     # Count available records (respecting mapping) to provide tqdm totals/ETAs.
     # This performs a quick pass over the compressed file(s); it's fast relative
     # to a full training run and gives accurate step counts for progress bars.
@@ -661,8 +666,13 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
     # rough total steps for scheduler (used if scheduler state not loaded)
     total_steps = args.epochs * (effective // args.batch_size if effective else 1000)
-    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=1000, num_training_steps=max(1, total_steps))
-
+    warmup_steps = max(1000, int(0.03 * total_steps))
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps, 
+        num_training_steps=max(1, total_steps)
+    )
+    scaler = torch.amp.GradScaler(enabled=use_bf16 and device.type == 'cuda')
     best_val = -1.0
 
     # global step counter used for WandB logging (monotonic across epochs)
@@ -690,6 +700,15 @@ def train(args):
                     scheduler.load_state_dict(ckpt['scheduler_state_dict'])
                 except Exception:
                     print('Warning: failed to fully load scheduler state')
+                # restore GradScaler state if available and enabled in this run
+                try:
+                    if 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None and scaler is not None and getattr(scaler, 'is_enabled', lambda: False)():
+                        try:
+                            scaler.load_state_dict(ckpt['scaler_state_dict'])
+                        except Exception:
+                            print('Warning: failed to load GradScaler state; continuing with fresh scaler')
+                except Exception:
+                    pass
             start_epoch = int(ckpt.get('epoch', 1))
             samples_processed = int(ckpt.get('samples_processed', 0))
             # restore global_step if saved in checkpoint, otherwise approximate
@@ -737,10 +756,16 @@ def train(args):
                     loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
             else:
                 loss, _ = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
+            scheduler.step()
+            
             # increment global_step once per optimization step/batch
             global_step += 1
             running_loss += loss.item()
@@ -759,7 +784,8 @@ def train(args):
                     'mapping': mapping,
                     'epoch': epoch,
                     'samples_processed': samples_processed,
-                    'global_step': global_step
+                        'global_step': global_step,
+                        'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
                 }, ckpt_path)
                 print(f'Saved periodic checkpoint to {ckpt_path} (samples_processed={samples_processed})')
                 if use_wandb:
@@ -855,7 +881,8 @@ def train(args):
             'epoch': epoch,
             'samples_processed': samples_processed,
             'metrics': metrics,
-            'global_step': global_step
+            'global_step': global_step,
+            'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
         }, epoch_save_path)
         print(f'Saved epoch checkpoint to {epoch_save_path}')
         if use_wandb:
@@ -875,7 +902,8 @@ def train(args):
                     'epoch': epoch,
                     'samples_processed': samples_processed,
                     'metrics': metrics,
-                    'global_step': global_step
+                    'global_step': global_step,
+                    'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
                 }, best_save_path)
                 print(f'Saved best model to {best_save_path}')
                 if use_wandb:
