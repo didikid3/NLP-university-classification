@@ -5,6 +5,7 @@ import json
 import importlib.util
 from pathlib import Path
 import time
+import math
 
 import torch
 import torch.nn as nn
@@ -130,6 +131,37 @@ def collate(batch, tokenizer, max_length):
     )
     enc["labels"] = labels
     return enc
+
+# ---------------------------------------------------------------------------
+# Count matching samples
+# ---------------------------------------------------------------------------
+
+def count_matching_samples(zst_path, mapping, max_samples=None):
+    """Count records in a zstd-compressed JSONL file whose subreddit matches mapping.
+
+    zst_path: path string or Path to .zst file
+    mapping: dict-like mapping of subreddit -> id (from load_mapping_py)
+    max_samples: optional int to stop counting after this many matches
+    """
+    dctx = zstd.ZstdDecompressor()
+    matched = 0
+    path = Path(zst_path)
+    with open(path, "rb") as fh:
+        with dctx.stream_reader(fh) as reader:
+            it = io.TextIOWrapper(reader, encoding="utf-8", errors="replace")
+            for line in it:
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                sub = obj.get("subreddit") or obj.get("subreddit_name")
+                if sub is None:
+                    continue
+                if sub in mapping:
+                    matched += 1
+                    if max_samples is not None and matched >= int(max_samples):
+                        break
+    return matched
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +314,31 @@ def train(args):
     # -------------------------------
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
-    total_steps = max(1, args.epochs * (1000 if args.max_train is None else max(1, args.max_train // args.batch_size)))
+    # Determine effective train sample count. Prefer explicit --max-train.
+    if args.max_train is not None:
+        effective_train_samples = int(args.max_train)
+    else:
+        effective_train_samples = None
+
+    # Count matching samples from the .zst stream when no explicit cap is provided.
+    if effective_train_samples is None:
+        try:
+            print("Counting matching training samples to compute total steps (this may take a while)...")
+            matched_count = count_matching_samples(args.train, mapping)
+            effective_train_samples = int(matched_count)
+            print(f"Found {matched_count} matching training samples")
+        except Exception as e:
+            print(f"Warning: failed to count training samples: {e}. Falling back to heuristic steps per epoch.")
+            effective_train_samples = None
+
+    if effective_train_samples is None:
+        # fallback heuristic (previous behavior)
+        total_steps = max(1, args.epochs * 1000)
+        steps_per_epoch_est = None
+    else:
+        steps_per_epoch_est = max(1, (effective_train_samples + args.batch_size - 1) // args.batch_size)
+        total_steps = max(1, args.epochs * steps_per_epoch_est)
+
     warmup_steps = int(0.06 * total_steps)
 
     scheduler = get_linear_schedule_with_warmup(
@@ -330,7 +386,13 @@ def train(args):
 
         # if we resumed and the checkpoint indicated we were at_epoch_end=True,
         # we should start from the next epoch (handled via start_epoch logic above)
-        for step, batch in enumerate(tqdm(train_loader, desc=f"Epoch {epoch}")):
+        # Provide a meaningful total to tqdm when we estimated steps per epoch above
+        if 'steps_per_epoch_est' in locals() and steps_per_epoch_est is not None:
+            iterator = tqdm(train_loader, desc=f"Epoch {epoch}", total=steps_per_epoch_est)
+        else:
+            iterator = tqdm(train_loader, desc=f"Epoch {epoch}")
+
+        for step, batch in enumerate(iterator):
             global_step += 1
             batch = {k: v.to(device) for k, v in batch.items()}
 
@@ -369,7 +431,7 @@ def train(args):
                 print(f"[Epoch {epoch} Step {step}] loss={avg_loss:.4f}")
 
                 if args.wandb:
-                    wandb.log({"train_loss": avg_loss, "step": global_step})
+                    wandb.log({"train_loss": avg_loss}, step=global_step)
 
                 running_loss = 0.0
 
@@ -435,9 +497,8 @@ def train(args):
                     if args.wandb:
                         wandb.log({
                             "val_acc": m_acc,
-                            "val_loss": m_avg_loss,
-                            "step": global_step
-                        })
+                            "val_loss": m_avg_loss
+                        }, step=global_step)
 
                     model.train()
 
@@ -469,7 +530,7 @@ def train(args):
             print(f"Validation accuracy: {acc:.4f} | loss={avg_val_loss:.4f}")
 
             if args.wandb:
-                wandb.log({"val_acc": acc, "val_loss": avg_val_loss, "step": global_step})
+                wandb.log({"val_acc": acc, "val_loss": avg_val_loss}, step=global_step)
 
         # -------------------------------------------------------------------
         # Save end-of-epoch checkpoint
