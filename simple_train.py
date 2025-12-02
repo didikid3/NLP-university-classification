@@ -527,6 +527,10 @@ def parse_args():
                    help="Save model every N training steps")
     p.add_argument("--max-checkpoints", type=int, default=5,
                help="Keep only the most recent N checkpoints (0=keep all)")
+    p.add_argument("--mid-eval-steps", type=int, default=0,
+               help="Run mid-epoch evaluation every N steps (0 = disabled)")
+    p.add_argument("--mid-eval-batches", type=int, default=20,
+               help="Number of validation batches to evaluate during mid-epoch evaluation")
 
 
     p.add_argument("--outdir", default="modernbert_out")
