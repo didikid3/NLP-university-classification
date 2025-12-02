@@ -450,6 +450,75 @@ def reservoir_sample(path, mapping, sample_size, text_key_priority=('title', 'se
     return reservoir
 
 
+def head_sample(path, mapping, sample_size, text_key_priority=('title', 'selftext')):
+    """Return the first `sample_size` matching records from a newline-JSON file.
+
+    This is a single-pass deterministic sampler: it yields the first matching
+    records encountered in file order (useful when `--eval-random` is not set).
+    """
+    p = Path(path)
+    if not p.exists() or sample_size <= 0:
+        return []
+    sample_size = int(sample_size)
+    dctx = zstd.ZstdDecompressor()
+    out = []
+    try:
+        with open(p, 'rb') as fh:
+            with dctx.stream_reader(fh) as reader:
+                it = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
+                for raw_line in it:
+                    try:
+                        obj = json.loads(raw_line)
+                    except Exception:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    sub = obj.get('subreddit') or obj.get('subreddit_name')
+                    if sub is None:
+                        continue
+                    label = mapping.get(sub)
+                    if label is None:
+                        continue
+                    parts = []
+                    for k in text_key_priority:
+                        v = obj.get(k)
+                        if v:
+                            parts.append(v)
+                    text = '\n'.join(parts).strip()
+                    if not text:
+                        continue
+                    out.append({'text': text, 'label': label})
+                    if len(out) >= sample_size:
+                        break
+    except zstd.ZstdError:
+        with open(p, 'r', encoding='utf-8', errors='replace') as fh_text:
+            for raw_line in fh_text:
+                try:
+                    obj = json.loads(raw_line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                sub = obj.get('subreddit') or obj.get('subreddit_name')
+                if sub is None:
+                    continue
+                label = mapping.get(sub)
+                if label is None:
+                    continue
+                parts = []
+                for k in text_key_priority:
+                    v = obj.get(k)
+                    if v:
+                        parts.append(v)
+                text = '\n'.join(parts).strip()
+                if not text:
+                    continue
+                out.append({'text': text, 'label': label})
+                if len(out) >= sample_size:
+                    break
+    return out
+
+
 def compute_label_counts(path, mapping, num_labels, max_limit=None):
     """Count label occurrences in a newline-JSON (.zst) file.
 
@@ -506,30 +575,28 @@ def compute_label_counts(path, mapping, num_labels, max_limit=None):
     return counts
 
 
-def train(args):
+def setup_environment(args):
+    """Configure device, seeds, and bfloat16/TF32 settings. Returns (device, use_bf16)."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # reproducibility: seed various RNGs if requested
     if getattr(args, 'seed', None) is not None:
         seed = int(args.seed)
-        # Python random
         random.seed(seed)
-        # numpy
         try:
             np.random.seed(seed)
         except Exception:
             pass
-        # torch
         try:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
         except Exception:
             pass
-        # set PYTHONHASHSEED for best-effort reproducibility (must be set before process start to be fully effective)
         try:
             os.environ['PYTHONHASHSEED'] = str(seed)
         except Exception:
             pass
+
     # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
     if getattr(args, 'enable_tf32', False) and torch.cuda.is_available():
         try:
@@ -543,6 +610,7 @@ def train(args):
                 pass
         except Exception:
             print("Some issue setting up TF 32")
+
     # bfloat16 usage: check if requested and supported
     use_bf16 = False
     if getattr(args, 'use_bf16', False) and torch.cuda.is_available():
@@ -556,6 +624,82 @@ def train(args):
             print('bfloat16 autocast enabled for training/eval')
         else:
             print('Warning: --use-bf16 requested but device/PyTorch does not report bf16 support; continuing without bf16')
+
+    return device, use_bf16
+
+
+def prepare_validation(args, tokenizer, mapping):
+    """Prepare validation dataset, DataLoader, collate, and optional pre-tokenized fixed eval loader."""
+    # validation dataset (no skipping needed)
+    val_ds = ZstdJsonDataset(args.val, mapping, max_samples=args.max_val) if args.val else None
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=lambda b: collate_batch(b, tokenizer, max_length=args.max_length)) if val_ds else None
+
+    # Collate that handles either raw-text examples (tokenize on the fly)
+    # or pre-tokenized examples (tensors already present). This lets us
+    # pre-tokenize a fixed evaluation subset and reuse it without paying
+    # the tokenization cost repeatedly.
+    def collate_maybe_pretokenized(batch):
+        first = batch[0]
+        # detect pre-tokenized items (they have tensor 'input_ids')
+        if isinstance(first.get('input_ids', None), torch.Tensor):
+            input_ids = torch.stack([b['input_ids'] for b in batch])
+            attention_mask = torch.stack([b['attention_mask'] for b in batch])
+            # labels might be tensors or ints
+            labels = []
+            for b in batch:
+                lab = b.get('labels')
+                if isinstance(lab, torch.Tensor):
+                    labels.append(int(lab.item()))
+                else:
+                    labels.append(int(lab))
+            labels = torch.tensor(labels, dtype=torch.long)
+            return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels}
+        # fallback: tokenize raw text examples
+        return collate_batch(batch, tokenizer, max_length=args.max_length)
+
+    collate = collate_maybe_pretokenized
+
+    # If the user requests a fixed evaluation subset via --eval-samples, build
+    # that subset once at startup and pre-tokenize it so repeated mid-epoch
+    # evaluations avoid both file I/O and tokenization overhead.
+    fixed_eval_loader = None
+    if getattr(args, 'eval_samples', 0) and args.eval_samples > 0 and args.val:
+        mode = 'random-once' if getattr(args, 'eval_random', False) else 'deterministic-head'
+        print(f'Preparing fixed evaluation subset of {args.eval_samples} samples from {args.val} (mode={mode}, pre-tokenizing)')
+        if getattr(args, 'eval_random', False):
+            sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+        else:
+            sampled = head_sample(args.val, mapping, args.eval_samples)
+        if len(sampled) == 0:
+            print('Warning: requested eval_samples but no validation samples found; falling back to full validation loader')
+        else:
+            texts = [e['text'] for e in sampled]
+            labels_tensor = torch.tensor([e['label'] for e in sampled], dtype=torch.long)
+            try:
+                enc = tokenizer(texts, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
+            except Exception:
+                enc_input_ids = []
+                enc_attention = []
+                for i in range(0, len(texts), 256):
+                    chunk = texts[i:i+256]
+                    e = tokenizer(chunk, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
+                    enc_input_ids.append(e['input_ids'])
+                    enc_attention.append(e['attention_mask'])
+                enc = {
+                    'input_ids': torch.cat(enc_input_ids, dim=0),
+                    'attention_mask': torch.cat(enc_attention, dim=0)
+                }
+            items = []
+            n = len(texts)
+            for i in range(n):
+                items.append({'input_ids': enc['input_ids'][i], 'attention_mask': enc['attention_mask'][i], 'labels': labels_tensor[i]})
+            fixed_eval_loader = DataLoader(ListDataset(items), batch_size=args.batch_size, collate_fn=collate)
+
+    return val_ds, val_loader, collate, fixed_eval_loader
+
+
+def train(args):
+    device, use_bf16 = setup_environment(args)
     mapping = load_mapping(args.mapping, args.dist, out_json=args.mapping if args.mapping and not Path(args.mapping).exists() else None)
     num_labels = len(mapping)
     print(f'Number of labels: {num_labels}')
@@ -616,6 +760,12 @@ def train(args):
         # log config
         wandb.config.update({k: v for k, v in vars(args).items() if not k.startswith('_')})
 
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        model = BertForCollege(args.model, num_labels, class_weight=(class_weight_tensor.tolist() if class_weight_tensor is not None else None))
+        model.to(device)
+
+        # prepare validation loaders/collate and optional fixed pre-tokenized eval loader
+        val_ds, val_loader, collate, fixed_eval_loader = prepare_validation(args, tokenizer, mapping)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = BertForCollege(args.model, num_labels, class_weight=(class_weight_tensor.tolist() if class_weight_tensor is not None else None))
     model.to(device)
@@ -624,23 +774,71 @@ def train(args):
     val_ds = ZstdJsonDataset(args.val, mapping, max_samples=args.max_val) if args.val else None
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=lambda b: collate_batch(b, tokenizer, max_length=args.max_length)) if val_ds else None
 
-    collate = lambda batch: collate_batch(batch, tokenizer, max_length=args.max_length)
+    # Collate that handles either raw-text examples (tokenize on the fly)
+    # or pre-tokenized examples (tensors already present). This lets us
+    # pre-tokenize a fixed evaluation subset and reuse it without paying
+    # the tokenization cost repeatedly.
+    def collate_maybe_pretokenized(batch):
+        first = batch[0]
+        # detect pre-tokenized items (they have tensor 'input_ids')
+        if isinstance(first.get('input_ids', None), torch.Tensor):
+            input_ids = torch.stack([b['input_ids'] for b in batch])
+            attention_mask = torch.stack([b['attention_mask'] for b in batch])
+            # labels might be tensors or ints
+            labels = []
+            for b in batch:
+                lab = b.get('labels')
+                if isinstance(lab, torch.Tensor):
+                    labels.append(int(lab.item()))
+                else:
+                    labels.append(int(lab))
+            labels = torch.tensor(labels, dtype=torch.long)
+            return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels}
+        # fallback: tokenize raw text examples
+        return collate_batch(batch, tokenizer, max_length=args.max_length)
+
+    collate = collate_maybe_pretokenized
     # If the user requests a fixed evaluation subset via --eval-samples, build
-    # that subset once at startup and reuse it for mid-epoch and epoch-end
-    # evaluation. This avoids repeatedly scanning the full validation file and
-    # ensures the same examples are evaluated each time.
+    # that subset once at startup and pre-tokenize it so repeated mid-epoch
+    # evaluations avoid both file I/O and tokenization overhead.
     fixed_eval_loader = None
     if getattr(args, 'eval_samples', 0) and args.eval_samples > 0 and args.val:
-        print(f'Preparing fixed evaluation subset of {args.eval_samples} samples from {args.val}')
-        sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+        mode = 'random-once' if getattr(args, 'eval_random', False) else 'deterministic-head'
+        print(f'Preparing fixed evaluation subset of {args.eval_samples} samples from {args.val} (mode={mode}, pre-tokenizing)')
+        # If eval_random is set, draw one random reservoir sample at startup.
+        # Otherwise, take the first `eval_samples` matching records (deterministic).
+        if getattr(args, 'eval_random', False):
+            sampled = reservoir_sample(args.val, mapping, args.eval_samples)
+        else:
+            sampled = head_sample(args.val, mapping, args.eval_samples)
         if len(sampled) == 0:
             print('Warning: requested eval_samples but no validation samples found; falling back to full validation loader')
         else:
-            fixed_eval_loader = DataLoader(
-                ListDataset(sampled),
-                batch_size=args.batch_size,
-                collate_fn=collate
-            )
+            # Pre-tokenize all sampled texts in one tokenizer call to produce
+            # input tensors on CPU; then build items that contain tensors so
+            # the DataLoader can batch without re-tokenizing.
+            texts = [e['text'] for e in sampled]
+            labels_tensor = torch.tensor([e['label'] for e in sampled], dtype=torch.long)
+            try:
+                enc = tokenizer(texts, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
+            except Exception:
+                # Fallback: tokenize in small batches if a single call fails
+                enc_input_ids = []
+                enc_attention = []
+                for i in range(0, len(texts), 256):
+                    chunk = texts[i:i+256]
+                    e = tokenizer(chunk, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
+                    enc_input_ids.append(e['input_ids'])
+                    enc_attention.append(e['attention_mask'])
+                enc = {
+                    'input_ids': torch.cat(enc_input_ids, dim=0),
+                    'attention_mask': torch.cat(enc_attention, dim=0)
+                }
+            items = []
+            n = len(texts)
+            for i in range(n):
+                items.append({'input_ids': enc['input_ids'][i], 'attention_mask': enc['attention_mask'][i], 'labels': labels_tensor[i]})
+            fixed_eval_loader = DataLoader(ListDataset(items), batch_size=args.batch_size, collate_fn=collate)
     # Count available records (respecting mapping) to provide tqdm totals/ETAs.
     # This performs a quick pass over the compressed file(s); it's fast relative
     # to a full training run and gives accurate step counts for progress bars.
@@ -793,38 +991,14 @@ def train(args):
 
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
-                # Mid-epoch evaluation. Prefer using the precomputed fixed eval
-                # subset (if created above when --eval-samples was set). If no
-                # fixed subset exists, fall back to either a per-call random
-                # reservoir sample (when --eval-random) or the validation loader
-                # (optionally limited by --eval-samples via evaluate's max_samples).
                 mid_metrics = None
-                # Use fixed subset if available
-                if fixed_eval_loader is not None:
-                    tmp_loader = fixed_eval_loader
-                    if use_bf16 and device.type == 'cuda':
-                        with autocast_context(device, dtype=torch.bfloat16):
-                            mid_metrics = evaluate(model, tmp_loader, device)
-                    else:
-                        mid_metrics = evaluate(model, tmp_loader, device)
+                tmp_loader = fixed_eval_loader if fixed_eval_loader is not None else val_loader
+                max_eval_samples = None if fixed_eval_loader is not None else (args.eval_samples if args.eval_samples and args.eval_samples > 0 else None)
+                if use_bf16 and device.type == 'cuda':
+                    with autocast_context(device, dtype=torch.bfloat16):
+                        mid_metrics = evaluate(model, tmp_loader, device, max_samples=max_eval_samples)
                 else:
-                    if getattr(args, 'eval_random', False) and args.eval_samples and args.eval_samples > 0:
-                        sampled = reservoir_sample(args.val, mapping, args.eval_samples)
-                        if len(sampled) == 0:
-                            print('Warning: eval_random requested but no validation samples found; skipping mid-epoch eval')
-                        else:
-                            tmp_loader = DataLoader(ListDataset(sampled), batch_size=args.batch_size, collate_fn=collate)
-                            if use_bf16 and device.type == 'cuda':
-                                with autocast_context(device, dtype=torch.bfloat16):
-                                    mid_metrics = evaluate(model, tmp_loader, device)
-                            else:
-                                mid_metrics = evaluate(model, tmp_loader, device)
-                    else:
-                        if use_bf16 and device.type == 'cuda':
-                            with autocast_context(device, dtype=torch.bfloat16):
-                                mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
-                        else:
-                            mid_metrics = evaluate(model, val_loader, device, max_samples=(args.eval_samples if args.eval_samples and args.eval_samples > 0 else None))
+                    mid_metrics = evaluate(model, tmp_loader, device, max_samples=max_eval_samples)
                 if mid_metrics is not None:
                     print(f'Validation metrics at samples {samples_processed}:', mid_metrics)
                     if use_wandb:
