@@ -575,28 +575,30 @@ def compute_label_counts(path, mapping, num_labels, max_limit=None):
     return counts
 
 
-def setup_environment(args):
-    """Configure device, seeds, and bfloat16/TF32 settings. Returns (device, use_bf16)."""
+def train(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # reproducibility: seed various RNGs if requested
     if getattr(args, 'seed', None) is not None:
         seed = int(args.seed)
+        # Python random
         random.seed(seed)
+        # numpy
         try:
             np.random.seed(seed)
         except Exception:
             pass
+        # torch
         try:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
         except Exception:
             pass
+        # set PYTHONHASHSEED for best-effort reproducibility (must be set before process start to be fully effective)
         try:
             os.environ['PYTHONHASHSEED'] = str(seed)
         except Exception:
             pass
-
     # Optionally enable TF32 / higher float32 matmul precision for speed on Ampere+ GPUs.
     if getattr(args, 'enable_tf32', False) and torch.cuda.is_available():
         try:
@@ -610,7 +612,6 @@ def setup_environment(args):
                 pass
         except Exception:
             print("Some issue setting up TF 32")
-
     # bfloat16 usage: check if requested and supported
     use_bf16 = False
     if getattr(args, 'use_bf16', False) and torch.cuda.is_available():
@@ -624,82 +625,6 @@ def setup_environment(args):
             print('bfloat16 autocast enabled for training/eval')
         else:
             print('Warning: --use-bf16 requested but device/PyTorch does not report bf16 support; continuing without bf16')
-
-    return device, use_bf16
-
-
-def prepare_validation(args, tokenizer, mapping):
-    """Prepare validation dataset, DataLoader, collate, and optional pre-tokenized fixed eval loader."""
-    # validation dataset (no skipping needed)
-    val_ds = ZstdJsonDataset(args.val, mapping, max_samples=args.max_val) if args.val else None
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, collate_fn=lambda b: collate_batch(b, tokenizer, max_length=args.max_length)) if val_ds else None
-
-    # Collate that handles either raw-text examples (tokenize on the fly)
-    # or pre-tokenized examples (tensors already present). This lets us
-    # pre-tokenize a fixed evaluation subset and reuse it without paying
-    # the tokenization cost repeatedly.
-    def collate_maybe_pretokenized(batch):
-        first = batch[0]
-        # detect pre-tokenized items (they have tensor 'input_ids')
-        if isinstance(first.get('input_ids', None), torch.Tensor):
-            input_ids = torch.stack([b['input_ids'] for b in batch])
-            attention_mask = torch.stack([b['attention_mask'] for b in batch])
-            # labels might be tensors or ints
-            labels = []
-            for b in batch:
-                lab = b.get('labels')
-                if isinstance(lab, torch.Tensor):
-                    labels.append(int(lab.item()))
-                else:
-                    labels.append(int(lab))
-            labels = torch.tensor(labels, dtype=torch.long)
-            return {'input_ids': input_ids, 'attention_mask': attention_mask, 'labels': labels}
-        # fallback: tokenize raw text examples
-        return collate_batch(batch, tokenizer, max_length=args.max_length)
-
-    collate = collate_maybe_pretokenized
-
-    # If the user requests a fixed evaluation subset via --eval-samples, build
-    # that subset once at startup and pre-tokenize it so repeated mid-epoch
-    # evaluations avoid both file I/O and tokenization overhead.
-    fixed_eval_loader = None
-    if getattr(args, 'eval_samples', 0) and args.eval_samples > 0 and args.val:
-        mode = 'random-once' if getattr(args, 'eval_random', False) else 'deterministic-head'
-        print(f'Preparing fixed evaluation subset of {args.eval_samples} samples from {args.val} (mode={mode}, pre-tokenizing)')
-        if getattr(args, 'eval_random', False):
-            sampled = reservoir_sample(args.val, mapping, args.eval_samples)
-        else:
-            sampled = head_sample(args.val, mapping, args.eval_samples)
-        if len(sampled) == 0:
-            print('Warning: requested eval_samples but no validation samples found; falling back to full validation loader')
-        else:
-            texts = [e['text'] for e in sampled]
-            labels_tensor = torch.tensor([e['label'] for e in sampled], dtype=torch.long)
-            try:
-                enc = tokenizer(texts, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
-            except Exception:
-                enc_input_ids = []
-                enc_attention = []
-                for i in range(0, len(texts), 256):
-                    chunk = texts[i:i+256]
-                    e = tokenizer(chunk, padding=True, truncation=True, max_length=args.max_length, return_tensors='pt')
-                    enc_input_ids.append(e['input_ids'])
-                    enc_attention.append(e['attention_mask'])
-                enc = {
-                    'input_ids': torch.cat(enc_input_ids, dim=0),
-                    'attention_mask': torch.cat(enc_attention, dim=0)
-                }
-            items = []
-            n = len(texts)
-            for i in range(n):
-                items.append({'input_ids': enc['input_ids'][i], 'attention_mask': enc['attention_mask'][i], 'labels': labels_tensor[i]})
-            fixed_eval_loader = DataLoader(ListDataset(items), batch_size=args.batch_size, collate_fn=collate)
-
-    return val_ds, val_loader, collate, fixed_eval_loader
-
-
-def train(args):
-    device, use_bf16 = setup_environment(args)
     mapping = load_mapping(args.mapping, args.dist, out_json=args.mapping if args.mapping and not Path(args.mapping).exists() else None)
     num_labels = len(mapping)
     print(f'Number of labels: {num_labels}')
@@ -760,12 +685,6 @@ def train(args):
         # log config
         wandb.config.update({k: v for k, v in vars(args).items() if not k.startswith('_')})
 
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        model = BertForCollege(args.model, num_labels, class_weight=(class_weight_tensor.tolist() if class_weight_tensor is not None else None))
-        model.to(device)
-
-        # prepare validation loaders/collate and optional fixed pre-tokenized eval loader
-        val_ds, val_loader, collate, fixed_eval_loader = prepare_validation(args, tokenizer, mapping)
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = BertForCollege(args.model, num_labels, class_weight=(class_weight_tensor.tolist() if class_weight_tensor is not None else None))
     model.to(device)
@@ -986,8 +905,6 @@ def train(args):
                         'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
                 }, ckpt_path)
                 print(f'Saved periodic checkpoint to {ckpt_path} (samples_processed={samples_processed})')
-                if use_wandb:
-                    wandb.save(str(ckpt_path))
 
             # periodic evaluation (mid-epoch)
             if args.eval_steps and samples_processed and samples_processed % args.eval_steps == 0 and val_loader is not None:
@@ -1059,8 +976,6 @@ def train(args):
             'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
         }, epoch_save_path)
         print(f'Saved epoch checkpoint to {epoch_save_path}')
-        if use_wandb:
-            wandb.save(str(epoch_save_path))
 
         # save best checkpoint based on validation score (if available)
         if metrics is not None:
@@ -1080,8 +995,6 @@ def train(args):
                     'scaler_state_dict': scaler.state_dict() if (scaler is not None and getattr(scaler, 'is_enabled', lambda: False)()) else None
                 }, best_save_path)
                 print(f'Saved best model to {best_save_path}')
-                if use_wandb:
-                    wandb.save(str(best_save_path))
         else:
             # no validation metrics available; optionally update best by other heuristics
             pass
