@@ -477,7 +477,7 @@ def train(args):
             # ---------------------
             # Periodic Checkpoint Saving
             # ---------------------
-            if args.save_steps and global_step % args.save_steps == 0:
+            if args.save_steps and step > 0 and step % args.save_steps == 0:
                 ckpt_dir = outdir / f"step_{global_step}"
                 ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -505,7 +505,7 @@ def train(args):
             # ---------------------
             # Mid-epoch evaluation
             # ---------------------
-            if args.mid_eval_steps and global_step % args.mid_eval_steps == 0:
+            if args.mid_eval_steps and step > 0 and step % args.mid_eval_steps == 0:
                 if mid_eval_loader:
                     model.eval()
                     m_correct = 0
